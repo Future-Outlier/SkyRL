@@ -78,6 +78,43 @@ def test_sender_thread_uses_trainer_device(monkeypatch, cuda_devices, device):
     assert torch.cuda.current_device() == device
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_extractor_preparation_runs_on_sender_device_before_group_creation(monkeypatch, cuda_devices, rank):
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    events = []
+
+    def prepare():
+        events.append(("prepare", torch.cuda.current_device()))
+
+    def init(info):
+        events.append(("init", torch.cuda.current_device()))
+        return SimpleNamespace(device=torch.cuda.current_device())
+
+    monkeypatch.setattr(broadcast_strategy, "nccl_trainer_init", init)
+    sender = asyncio.run(
+        asyncio.to_thread(
+            BroadcastTransferStrategy.create_sender,
+            _init_info(),
+            AsyncMock(),
+            SimpleNamespace(prepare_broadcast=prepare),
+        )
+    )
+    assert events == ([("prepare", 2), ("init", 2)] if rank == 0 else [])
+    assert (sender._model_update_group is None) == (rank != 0)
+
+
+def test_extractor_preparation_failure_stops_group_creation(monkeypatch, cuda_devices):
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    init = Mock()
+    monkeypatch.setattr(broadcast_strategy, "nccl_trainer_init", init)
+    extractor = SimpleNamespace(prepare_broadcast=Mock(side_effect=RuntimeError("invalid channel policy")))
+    with pytest.raises(RuntimeError, match="invalid channel policy"):
+        BroadcastTransferStrategy.create_sender(_init_info(), AsyncMock(), extractor)
+    init.assert_not_called()
+
+
 @pytest.mark.parametrize("derive_metadata", [False, True])
 def test_each_send_thread_uses_communicator_device(monkeypatch, cuda_devices, derive_metadata):
     torch.cuda.set_device(2)

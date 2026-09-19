@@ -347,6 +347,9 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
         Args:
             init_info: BroadcastInitInfo from create_init_info.
             inference_client: Client for coordinating with inference engines.
+            weight_extractor: Optional extractor with a synchronous, rank-0-only
+                ``prepare_broadcast()`` hook. Called on the assigned CUDA device
+                before communicator creation; exceptions abort initialization.
         """
         rank = torch.distributed.get_rank()
         model_update_group = None
@@ -354,12 +357,9 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
         if rank == 0:
             # create_sender runs in asyncio.to_thread; it does not inherit the actor's CUDA device.
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-            if weight_extractor is not None and type(weight_extractor).__module__.startswith("isoexec."):
-                from isoexec.runtimes.vllm.nccl_channels import (
-                    install_pynccl_channel_policy,
-                )
-
-                install_pynccl_channel_policy()
+            prepare_broadcast = getattr(weight_extractor, "prepare_broadcast", None)
+            if prepare_broadcast is not None:
+                prepare_broadcast()
             model_update_group = nccl_trainer_init(
                 dict(
                     master_address=init_info.master_addr,

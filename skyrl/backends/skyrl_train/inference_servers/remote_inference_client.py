@@ -1022,6 +1022,13 @@ class RemoteInferenceClient(InferenceEngineInterface):
         )
         return {url: resp for url, resp in results}
 
+    async def collective_rpc(self, method: str, kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Call a worker extension method on every server and preserve per-server responses."""
+        payload = {"method": method}
+        if kwargs is not None:
+            payload["kwargs"] = kwargs
+        return await self._call_all_servers("/collective_rpc", payload)
+
     async def pause(self, mode: Union[PauseMode, str] = PauseMode.KEEP, clear_cache: bool = False) -> Dict[str, Any]:
         """
         Pause generation on all backends.
@@ -1102,15 +1109,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         params = {"tags": tags} if tags else {}
         result = await self._call_all_servers("/wake_up", params=params)
-        # A weights-only wake is the first phase of a level-2 weight sync: the
-        # allocator has recreated discarded storage, but the new payload has not
-        # arrived yet. Verify after the broadcast when KV is woken (or on any
-        # ordinary all-resource wake), never against the previous receipt here.
-        if self.uses_isoexec and tags != ["weights"]:
-            await self._call_all_servers(
-                "/collective_rpc",
-                {"method": "isoexec_verify_after_wake"},
-            )
+        if self.uses_isoexec:
+            from isoexec.integrations.skyrl.inference import verify_after_wake
+
+            await verify_after_wake(self, tags)
         return result
 
     async def sleep_for_weight_sync(self, offload_kv: bool = True) -> Dict[str, Any]:
@@ -1138,11 +1140,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
             "/collective_rpc",
             {"method": "skyrl_wake_for_weight_sync", "kwargs": {"tags": tags}},
         )
-        if self.uses_isoexec and tags != ["weights"]:
-            await self._call_all_servers(
-                "/collective_rpc",
-                {"method": "isoexec_verify_after_wake"},
-            )
+        if self.uses_isoexec:
+            from isoexec.integrations.skyrl.inference import verify_after_wake
+
+            await verify_after_wake(self, tags)
         return result
 
     async def reset_prefix_cache(
@@ -1416,18 +1417,6 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # ---------------------------
     # Info
     # ---------------------------
-
-    async def get_weight_sync_destinations(self) -> Dict[str, List[dict]]:
-        """Query IsoExec's live TP/EP placement together with each worker's physical GPU UUID."""
-        results = await self._call_all_servers("/collective_rpc", {"method": "isoexec_weight_sync_destination"})
-        reports = {}
-        for server_url in self.server_urls:
-            response = results.get(server_url) or {}
-            workers = (response.get("body") or {}).get("results")
-            if not isinstance(workers, list) or not workers:
-                raise RuntimeError(f"weight_sync.destination: missing worker reports from {server_url}")
-            reports[server_url] = workers
-        return reports
 
     async def get_gpu_uuids(self) -> Dict[str, List[str]]:
         """Query each DP server's TP/PP workers for their current physical GPU UUIDs."""

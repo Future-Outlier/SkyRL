@@ -44,6 +44,11 @@ vLLM worker-extension class (loaded via `--worker-extension-cls`):
 
 The weight sync implementation relies on the native vLLM weight sync APIs - `WeightTransferEngine` abstractions as well as native RPC endpoints for weight updates.
 
+The broadcast strategy accepts an optional synchronous extractor `prepare_broadcast()` hook. It runs
+only on trainer rank 0, in the sender thread after selecting `LOCAL_RANK`'s CUDA device and before
+`nccl_trainer_init`. Hook exceptions propagate; ordinary extractors need no hook. IsoExec installs
+its channel policy through this seam, rather than framework code detecting a package name.
+
 ## Transfer Strategies
 
 - **Broadcast** (`BroadcastTransferStrategy`): NCCL collective. Used for **non-colocated** setups. Training and inference are on different GPUs; weights cross the wire over a dedicated process group.

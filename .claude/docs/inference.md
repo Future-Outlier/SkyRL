@@ -12,6 +12,10 @@ For training-to-inference weight transfer (`NewInferenceWorkerWrap`, broadcast v
 - Full-vocabulary diagnostic payloads require the opt-in IsoExec package. `generate_wire.py` keeps lazy
   codec entry points; encoding/validation lives in `isoexec.integrations.full_distribution`. Sampled
   logprobs and routed-expert payloads remain native and import no IsoExec codec.
+- `RemoteInferenceClient.collective_rpc(method, kwargs=None)` exposes the existing per-server fan-out,
+  preserving responses and exceptions. IsoExec owns its worker method names and destination parsing.
+  Native wake methods await the optional IsoExec adapter only after wake succeeds; the adapter defers
+  applied-weight verification for a weights-only wake until the post-sync KV wake.
 
 ## vLLM Router
 

@@ -89,6 +89,7 @@ async def test_action_mode_logprobs_minus_one_does_not_request_full_payload(monk
 
 @pytest.mark.asyncio
 async def test_isoexec_wake_verifies_applied_weights():
+    pytest.importorskip("isoexec.integrations.skyrl.inference")
     client = RemoteInferenceClient(
         proxy_url="http://unused",
         server_urls=["http://unused"],
@@ -107,6 +108,7 @@ async def test_isoexec_wake_verifies_applied_weights():
 
 @pytest.mark.asyncio
 async def test_isoexec_weights_only_wake_defers_verification_until_after_sync():
+    pytest.importorskip("isoexec.integrations.skyrl.inference")
     client = RemoteInferenceClient(
         proxy_url="http://unused",
         server_urls=["http://unused"],
@@ -127,6 +129,7 @@ async def test_isoexec_weights_only_wake_defers_verification_until_after_sync():
 
 @pytest.mark.asyncio
 async def test_isoexec_direct_weight_sync_wake_defers_verification_until_kv_restore():
+    pytest.importorskip("isoexec.integrations.skyrl.inference")
     client = RemoteInferenceClient(
         proxy_url="http://unused",
         server_urls=["http://unused"],
