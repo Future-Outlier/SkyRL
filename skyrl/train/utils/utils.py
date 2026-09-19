@@ -570,134 +570,13 @@ def validate_logprob_comparison(cfg: SkyRLTrainConfig):
         )
     if mode == "action":
         return
-    megatron = trainer.policy.megatron_config
-    placement = trainer.placement
-    policy_gpus = placement.policy_num_gpus_per_node
-    tp, pp = megatron.tensor_model_parallel_size, megatron.pipeline_model_parallel_size
-    cp, ep = megatron.context_parallel_size, megatron.expert_model_parallel_size
-    # Context parallelism multiplies the model-parallel footprint like TP and PP do: a CP group of 2
-    # holds ONE replica's tokens, so dense DP is what is left after TP x PP x CP.
-    model_parallel = tp * pp * cp if isinstance(cp, int) and cp >= 1 else 0
-    dense_dp = policy_gpus // model_parallel if model_parallel and policy_gpus % model_parallel == 0 else 0
-    engine_gpus = (
-        engine.num_engines * engine.tensor_parallel_size * engine.pipeline_parallel_size * engine.data_parallel_size
+    if not trainer.enable_isoexec:
+        raise ValueError("full logprob comparison requires trainer.enable_isoexec=true")
+    from isoexec.integrations.skyrl.full_distribution_config import (
+        validate_full_distribution_config,
     )
-    sequence_parallel = megatron.transformer_config_kwargs.get("sequence_parallel", False)
 
-    # Every requirement is named, so a refusal says which one failed instead of reciting the whole profile.
-    requirements = [
-        (trainer.strategy == "megatron", "trainer.strategy=megatron"),
-        (trainer.enable_isoexec, "trainer.enable_isoexec=true"),
-        (engine.backend == "vllm", "inference_engine.backend=vllm"),
-        (not trainer.fully_async.enabled, "synchronous training (fully_async disabled)"),
-        (not trainer.mtp.enabled, "trainer.mtp disabled"),
-        (not trainer.fused_lm_head_logprob, "trainer.fused_lm_head_logprob=false (the full row needs the logits)"),
-        (trainer.remove_microbatch_padding, "trainer.remove_microbatch_padding=true (packed sequences)"),
-        (generator.batched, "generator.batched=true"),
-        (not generator.vision_language_generator, "text-only generator"),
-        (generator.max_turns == 1, "single-turn generation"),
-        (not generator.step_wise_trajectories, "no step-wise trajectories"),
-        (trainer.algorithm.dynamic_sampling.type is None, "no dynamic sampling"),
-        (trainer.policy.model.lora.rank == 0, "no LoRA"),
-        (placement.policy_num_nodes == 1, "a single policy node"),
-        # -- trainer mesh: TP x PP divides the policy GPUs and the rest is dense data parallelism. Every
-        # last-stage rank scores rows: DP replicas their own samples, TP ranks their own vocabulary slice;
-        # pipeline stages other than the last hold no head and compare nothing.
-        (
-            dense_dp >= 1,
-            f"tensor x pipeline x context parallel size ({tp} x {pp} x {cp}) dividing the {policy_gpus} policy GPUs",
-        ),
-        # IsoExec runs context parallelism at degree 2 on dense softmax-attention models (every CP rank
-        # scores the rows whose predictor token it holds; the ranks' rows are disjoint and tile the
-        # batch). The model-dependent half is refused by IsoExec at build, where the rows are known.
-        (cp in (1, 2), "context_parallel_size in (1, 2)"),
-        (cp == 1 or ep == 1, "expert_model_parallel_size=1 under context parallelism"),
-        # IsoExec's expert mesh at expert TP 1: every TP rank owns experts, so an EP group is a union of
-        # WHOLE TP groups that tile TP x dense DP. EP = TP x dense DP is one replica per expert shard;
-        # a smaller such EP leaves TP x DP / EP replicas (expert data parallelism), which IsoExec
-        # admits only inside its own qualification run.
-        (
-            ep == 1 or (tp >= 1 and ep % tp == 0 and dense_dp >= 1 and (tp * dense_dp) % ep == 0),
-            f"expert_model_parallel_size 1, or a multiple of TP={tp} that divides TP x dense DP = {tp * dense_dp}",
-        ),
-        (megatron.expert_tensor_parallel_size in (None, 1), "expert_tensor_parallel_size unset or 1"),
-        (
-            megatron.transformer_config_kwargs.get("virtual_pipeline_model_parallel_size") is None,
-            "no virtual pipeline parallelism",
-        ),
-        (
-            isinstance(sequence_parallel, bool) and (not sequence_parallel or tp > 1),
-            "transformer_config_kwargs.sequence_parallel is a bool and needs tensor_model_parallel_size > 1",
-        ),
-        # -- engines
-        (engine.run_engines_locally, "inference_engine.run_engines_locally=true"),
-        (not engine.enable_pd, "no prefill/decode disaggregation"),
-        # Engine pipeline stages are admitted by the IsoExec engine host itself (a stage is a contiguous
-        # slice of the model; the stream crosses the boundary as bytes and only the last stage serves
-        # rows). Every engine worker -- any TP rank of any stage -- still receives the weight stream.
-        (
-            isinstance(engine.pipeline_parallel_size, int) and engine.pipeline_parallel_size >= 1,
-            "inference_engine.pipeline_parallel_size >= 1",
-        ),
-        # Engine expert parallelism is IsoExec's own dispatch over the engine's data-parallel ranks (vLLM's
-        # all2all stays off; IsoExec forces enable_expert_parallel=False and carries the degree itself): the
-        # only shape it hosts is EP = data_parallel_size x tensor_parallel_size with DP > 1.
-        (
-            engine.expert_parallel_size == 1
-            or (
-                engine.data_parallel_size > 1
-                and engine.expert_parallel_size == engine.data_parallel_size * engine.tensor_parallel_size
-            ),
-            "inference_engine.expert_parallel_size=1, or = data_parallel_size x tensor_parallel_size with "
-            "data_parallel_size > 1",
-        ),
-        (engine.speculative_config is None, "no speculative decoding"),
-        (engine.fp8_weight_sync_mode is None, "no fp8 weight sync"),
-        (
-            generator.sampling_params.temperature == trainer.algorithm.temperature == 1.0,
-            "temperature=1 on both sides",
-        ),
-        (generator.sampling_params.logprobs is not None, "generator.sampling_params.logprobs set"),
-    ]
-    if placement.colocate_all:
-        # Colocated weight sync is CUDA IPC keyed by GPU: every engine worker opens the buffer of the
-        # trainer rank that shares its GPU, and every trainer rank publishes the whole model (TP gathers,
-        # pipeline stages are completed, DP replicas are whole), resharded for the engine TP/EP ranks
-        # verified on its GPU. The engines may occupy any PREFIX of the
-        # policy GPUs; a strict subset needs placement.asymmetric_colocation.
-        requirements += [
-            (
-                engine_gpus <= policy_gpus,
-                f"colocated engines ({engine_gpus} GPUs) fitting the {policy_gpus} policy GPUs",
-            ),
-            (
-                engine_gpus >= policy_gpus or placement.asymmetric_colocation,
-                "placement.asymmetric_colocation=true when the engines use fewer GPUs than the policy",
-            ),
-            (
-                engine.data_parallel_size == 1
-                or (
-                    engine.data_parallel_size > 1
-                    and engine.expert_parallel_size == engine.data_parallel_size * engine.tensor_parallel_size
-                ),
-                "inference_engine.data_parallel_size=1 when colocated, or IsoExec engine EP = DP x TP with DP > 1",
-            ),
-        ]
-    else:
-        # Non-colocated: trainer rank 0 broadcasts full logical tensors over NCCL; every engine rank
-        # slices its own shard, so tensor-parallel or replicated engines are served by any trainer mesh.
-        requirements += [
-            (engine.weight_sync_backend == "nccl", "inference_engine.weight_sync_backend=nccl when not colocated"),
-            (engine.data_parallel_size >= 1, "inference_engine.data_parallel_size >= 1"),
-        ]
-    failed = [reason for ok, reason in requirements if not ok]
-    if failed:
-        raise ValueError(
-            "full logprob comparison requires enable_isoexec=true with synchronous, packed, text-only, "
-            "single-turn batched Megatron/vLLM at temperature=1; unmet: " + "; ".join(failed)
-        )
-    if generator.eval_sampling_params is not None:
-        generator.eval_sampling_params.logprobs = None
+    validate_full_distribution_config(cfg)
 
 
 def validate_generator_cfg(cfg: SkyRLTrainConfig):
@@ -836,7 +715,10 @@ def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
             f"Got dp_size={dp_size}, tp_size={tp_size}, ep_size={ep_size}"
         )
 
-    assert ie_cfg.distributed_executor_backend in ("mp", "ray"), "invalid distributed executor backend"
+    assert ie_cfg.distributed_executor_backend in (
+        "mp",
+        "ray",
+    ), "invalid distributed executor backend"
 
     if ie_cfg.enable_return_routed_experts:
         assert (
