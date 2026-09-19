@@ -1435,7 +1435,7 @@ class TrainerConfig(BaseConfig):
     ``"action"`` preserves the sampled-token diagnostic. ``"full"`` requires matching
     ``generator.inference_engine.logprob_output`` and compares every float32 vocabulary entry
     bitwise through IsoExec before optimizer mutation. Full mode requires
-    ``enable_isoexec=True`` and disables evaluation logprobs."""
+    ``enable_isoexec=True``, the installed IsoExec diagnostic codec, and disables evaluation logprobs."""
     placement: PlacementConfig = field(default_factory=PlacementConfig)
     use_expandable_segments: bool = True
     """Enable PyTorch's CUDA ``expandable_segments`` allocator on the training workers.

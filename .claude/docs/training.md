@@ -37,6 +37,11 @@ uv run --isolated --extra megatron --env-file .env.test -m skyrl.train.entrypoin
 
 ## Example Scripts
 
+Full-distribution diagnostics retain the native rollout and policy-prescore boundaries. Row alignment,
+comparison-payload attachment and release are supplied by `isoexec.integrations.skyrl.full_distribution`;
+the reference forward must complete before the policy-only evidence is attached. Tests of these opt-in
+paths require the IsoExec package; default/action-mode tests do not.
+
 Located in `examples/train/<task>/`:
 - `examples/train/gsm8k/` — GSM8K math training
 - `examples/train/text_to_sql/` — SQL training

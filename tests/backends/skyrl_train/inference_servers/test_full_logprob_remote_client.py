@@ -14,6 +14,7 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 
 @pytest.mark.asyncio
 async def test_full_logprobs_use_skyrl_endpoint_and_decode_rows(monkeypatch):
+    pytest.importorskip("isoexec.integrations.full_distribution")
     client = RemoteInferenceClient(
         proxy_url="http://unused",
         server_urls=["http://unused"],

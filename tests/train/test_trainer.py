@@ -63,6 +63,7 @@ def dummy_generator():
 
 
 def test_convert_to_training_input_right_aligns_full_logprob_rows(dummy_config, dummy_tokenizer, dummy_generator):
+    pytest.importorskip("isoexec.integrations.skyrl.full_distribution")
     dummy_config.trainer.rollout_logprob_comparison = "full"
     dummy_config.trainer.policy_mini_batch_size = 2
     dummy_config.generator.inference_engine.enable_ray_prometheus_stats = False
@@ -105,6 +106,7 @@ def test_convert_to_training_input_right_aligns_full_logprob_rows(dummy_config, 
 
 
 def test_full_logprob_rows_are_forwarded_only_to_policy_prescore(dummy_config, dummy_tokenizer, dummy_generator):
+    pytest.importorskip("isoexec.integrations.skyrl.full_distribution")
     dummy_config.trainer.rollout_logprob_comparison = "full"
     dummy_config.trainer.algorithm.use_kl_loss = True
     dummy_config.generator.inference_engine.enable_ray_prometheus_stats = False

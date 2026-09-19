@@ -9,6 +9,9 @@ For training-to-inference weight transfer (`NewInferenceWorkerWrap`, broadcast v
     - **Data plane**: Interact with router for completions requests.
     - **Control plane**: Fan-out to individual server URLs for weight sync, pause/resume.
 - Shared inference interfaces and types live in `inference_servers/base.py` (`InferenceEngineInterface`, `InferenceEngineInput`/`Output`, `ConversationType`); shared helpers (`build_engine_runtime_env`, `get_sampling_params_for_backend`) live in `inference_servers/engine_utils.py`.
+- Full-vocabulary diagnostic payloads require the opt-in IsoExec package. `generate_wire.py` keeps lazy
+  codec entry points; encoding/validation lives in `isoexec.integrations.full_distribution`. Sampled
+  logprobs and routed-expert payloads remain native and import no IsoExec codec.
 
 ## vLLM Router
 
