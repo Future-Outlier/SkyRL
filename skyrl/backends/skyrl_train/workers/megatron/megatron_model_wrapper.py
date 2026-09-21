@@ -194,6 +194,13 @@ class MegatronModelWrapper:
         self._pending_grad_sync: Optional[dict] = None
 
         config = get_model_config(self.actor_module[0])
+        self._packed_logprobs = from_parallel_logits_to_logprobs_packed_sequences
+        self._forward_kwargs = {}
+        self._finalize_grads = finalize_model_grads
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.scoring import bind
+
+            bind(self, config)
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
         # use the built-in finalize_model_grads function to all reduce gradients across
         # parallelism dimensions -- but deferred to optim_step rather than run per
@@ -479,6 +486,7 @@ class MegatronModelWrapper:
                     packed_seq_params=packed_seq_params,
                     output_processor=fused_lm_head_output_processor,
                     output_processor_context=_op_ctx,
+                    **self._forward_kwargs,
                     **model_replay_kwargs,
                     **vlm_inputs,
                 )
@@ -1153,6 +1161,7 @@ class MegatronModelWrapper:
                         packed_seq_params=packed_seq_params,
                         output_processor=fused_lm_head_output_processor,
                         output_processor_context=_op_ctx,
+                        **self._forward_kwargs,
                         **model_replay_kwargs,
                         **vlm_inputs,
                     )
@@ -1163,6 +1172,7 @@ class MegatronModelWrapper:
                         new_position_ids,
                         to_te_attention_mask(new_attention_mask),
                         packed_seq_params=packed_seq_params,
+                        **self._forward_kwargs,
                         **model_replay_kwargs,
                         **vlm_inputs,
                     )

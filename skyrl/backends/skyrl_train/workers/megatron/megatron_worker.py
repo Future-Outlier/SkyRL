@@ -1087,6 +1087,11 @@ class MegatronWorker:
 
         return padded
 
+    def isoexec_refusal_receipt(self):
+        from isoexec.integrations.skyrl.audit import trainer_receipt
+
+        return trainer_receipt(self)
+
     def save_hf_model(self, export_dir: str, tokenizer):
         if getattr(self.cfg, "enable_isoexec", False):
             from isoexec.integrations.skyrl.megatron import save_hf_model
@@ -1164,6 +1169,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             seed=self.cfg.seed,
             is_lora=self._is_lora,
             node_local_rank=self._local_rank,
+            enable_isoexec=self.cfg.enable_isoexec,
         )
         if self.cfg.enable_isoexec:
             from isoexec.integrations.skyrl.megatron import channel_config
@@ -1324,6 +1330,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         ``metrics``; it has no effect on the inference path.
         """
         if loss_fn is None:
+            if self.cfg.enable_isoexec:
+                from isoexec.debug.refusal.weights import check_trainer_scoring
+                from isoexec.integrations.skyrl.scoring import _find_isoexec_stage
+
+                check_trainer_scoring(_find_isoexec_stage(self.actor_module))
             # Megatron inference forward path: emit per-sample logprobs. Token-based
             # micro-batching (when `max_tokens_per_microbatch > 0`) is handled inside
             # `_forward_logprobs`, which also reorders back to the original sample order.
@@ -1641,7 +1652,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # whole accumulated window. Deferred out of forward_backward because the reduce
         # is not idempotent -- running it per call corrupts gradients once a window
         # spans more than one call.
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import check_optimizer_update
+
+            check_optimizer_update(self, "before-finalize")
         self.model.run_pending_grad_sync()
+        if self.cfg.enable_isoexec:
+            check_optimizer_update(self, "after-finalize")
 
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
         if self.cfg.enable_isoexec:
@@ -2087,6 +2104,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             optimizer_config=None,
             seed=self.cfg.seed,
             node_local_rank=self._local_rank,
+            enable_isoexec=self.cfg.enable_isoexec,
         )
         if self.cfg.enable_isoexec:
             from isoexec.integrations.skyrl.megatron import channel_config
@@ -2119,6 +2137,11 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         bridge_weights_path = self._maybe_setup_fake_int4_qat()
 
         # initialize the bridge and provider objects
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import init_model
+
+            return init_model(self, model_path, num_training_steps, section="ref")
+
         self.init_configs(
             model_path,
             self.cfg.ref.megatron_config,

@@ -344,6 +344,7 @@ def build_new_inference_client(
         uses_isoexec=cfg.trainer.enable_isoexec,
         preserve_weights_on_sleep=preserve_weights_on_sleep,
         uses_lora_weight_sync=_uses_lora_weight_sync(cfg),
+        verify_isoexec_weights=cfg.trainer.enable_isoexec,
         data_parallel_size=ie_cfg.data_parallel_size,
         tokenizer=tokenizer,
     )
