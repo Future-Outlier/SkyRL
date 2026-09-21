@@ -325,11 +325,10 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
 
         model, _ = self.skyrl_weight_update_target()
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
-            # IsoExec may install a host loader that owns applied-byte receipts.
-            host_loader = getattr(self, "_skyrl_load_kernel_weights", None)
-            if callable(host_loader):
-                host_loader(weights)
-            elif getattr(self, "_weight_update_is_draft", False) or self._skyrl_is_checkpoint_format:
+            # Checkpoint/draft use HF loaders. Kernel format goes through
+            # ``_skyrl_load_kernel_weights`` so IsoExec's WorkerExtension can
+            # override that method for applied-byte receipts.
+            if getattr(self, "_weight_update_is_draft", False) or self._skyrl_is_checkpoint_format:
                 _load_checkpoint_weights(model, weights)
             else:
                 self._skyrl_load_kernel_weights(weights)
@@ -380,18 +379,14 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         engine = self.weight_transfer_engine
         typed_update_info = engine.parse_update_info(update_info)
         model, model_config = self.skyrl_weight_update_target()
-        # A host loader (e.g. IsoExec's applied-byte receiver) owns the received
-        # tensors when present, exactly as update_weights_ipc dispatches; it also
-        # consumes the sender's handshake/version/digest sentinels. Draft sync
-        # uses a separate weight-update target session instead of reloading the
-        # legacy spec-decode drafter helper.
-        host_loader = getattr(self, "_skyrl_load_kernel_weights", None)
 
         def _load_weights(weights):
+            # Mirror update_weights_ipc: IsoExec forces kernel format and overrides
+            # ``_skyrl_load_kernel_weights``; stock checkpoint/draft stay on HF load.
             weights = list(weights)
-            if callable(host_loader):
-                return host_loader(weights)
-            return _load_checkpoint_weights(model, weights)
+            if getattr(self, "_weight_update_is_draft", False) or self._skyrl_is_checkpoint_format:
+                return _load_checkpoint_weights(model, weights)
+            return self._skyrl_load_kernel_weights(weights)
 
         # Interpose the batched-MoE FP8 loader, then restore this session's model.
         engine.set_weight_update_target(
