@@ -83,6 +83,7 @@ def test_ipc_uses_metadata_from_the_handle_owning_gpu(monkeypatch, receiver_rank
     received = []
     worker = SimpleNamespace(
         _skyrl_weight_update_active=True,
+        _weight_update_active=True,
         weight_transfer_engine=object(),
         device="cpu",
         vllm_config=None,
