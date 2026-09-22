@@ -49,8 +49,10 @@ async def test_step_capture_collects_every_engine_rank(tmp_path, monkeypatch, ve
     )
     ranks = [
         {
+            "step": 7,
             "artifact_dir": f"/capture/rank{i}",
             "verdict": "clean",
+            "process_receipt": {"pid": 100 + i, "rank": i},
             "trace": [
                 {
                     "request_aliases": {
@@ -62,13 +64,19 @@ async def test_step_capture_collects_every_engine_rank(tmp_path, monkeypatch, ve
         }
         for i in range(4)
     ]
+    for i, receipt in enumerate(ranks):
+        receipt["server_url"] = f"http://engine{i // 2}"
     ranks[0]["verdict"] = verdict
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
 
     @asynccontextmanager
     async def respond(method, url, **kwargs):
-        results = ranks[:2] if url.startswith("http://engine0/") else ranks[2:]
+        selected = ranks[:2] if url.startswith("http://engine0/") else ranks[2:]
+        if kwargs["json"]["method"] == "isoexec_refusal_begin_step":
+            results = [{"step": 7, "started": True, "worker": receipt["process_receipt"]} for receipt in selected]
+        else:
+            results = selected
         yield SimpleNamespace(
             content_length=1,
             status=200,
@@ -87,13 +95,14 @@ async def test_step_capture_collects_every_engine_rank(tmp_path, monkeypatch, ve
             request_id.split("--")[0],
         )
     session.request.reset_mock()
-    assert await client.isoexec_refusal_end_step() == ranks
-    records = [json.loads(line) for line in Path(ranks[0]["request_outputs"]).read_text().splitlines()]
+    receipts = await client.isoexec_refusal_end_step()
+    assert [{key: value for key, value in receipt.items() if key != "request_outputs"} for receipt in receipts] == ranks
+    records = [json.loads(line) for line in Path(receipts[0]["request_outputs"]).read_text().splitlines()]
     assert [record["request_id"] for record in records] == [
         "internal-kept",
         "internal-discarded",
     ]
-    assert (Path(ranks[0]["request_outputs"]).parent / "mismatch").exists() == (verdict != "clean")
+    assert (Path(receipts[0]["request_outputs"]).parent / "mismatch").exists() == (verdict != "clean")
     assert session.request.call_count == 2
     assert {call.args[:2] for call in session.request.call_args_list} == {
         ("POST", "http://engine0/collective_rpc"),
@@ -189,6 +198,7 @@ async def test_batched_generator_carries_unique_sessions_only_during_capture(mon
         apply_overlong_filtering=False,
         max_input_length=32,
         sampling_params=SimpleNamespace(max_generate_length=8),
+        inference_engine=SimpleNamespace(logprob_output="action"),
     )
     generator.tokenizer = SimpleNamespace(apply_chat_template=Mock(return_value=[[1, 2], [1, 2]]))
     generator._compute_cache_salt = Mock(return_value=None)

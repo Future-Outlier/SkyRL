@@ -1103,27 +1103,34 @@ class RemoteInferenceClient(InferenceEngineInterface):
         return await self.resume()
 
     async def isoexec_refusal_begin_step(self, run_name: str, step: int, request_map: dict) -> dict[str, Any]:
-        from isoexec.integrations.skyrl.audit import begin_requests
+        from isoexec.integrations.skyrl.audit import begin_engine_roster, begin_requests
 
         begin_requests(self, run_name, step)
-        return await self._call_all_servers(
+        responses = await self._call_all_servers(
             "/collective_rpc",
             {
                 "method": "isoexec_refusal_begin_step",
                 "kwargs": {"run_name": run_name, "step": step, "request_map": request_map},
             },
         )
+        roster = begin_engine_roster(responses, self.server_urls, step)
+        previous = getattr(self, "_isoexec_refusal_roster", None)
+        if previous is not None and previous != roster:
+            raise ValueError("IsoExec engine worker roster changed during the training step")
+        self._isoexec_refusal_roster = roster
+        return responses
 
     async def isoexec_refusal_end_step(self) -> list[dict[str, Any]]:
-        from isoexec.integrations.skyrl.audit import finish_requests
+        from isoexec.integrations.skyrl.audit import end_engine_roster, finish_requests
 
         responses = await self._call_all_servers("/collective_rpc", {"method": "isoexec_refusal_end_step"})
-        receipts = [receipt for response in responses.values() for receipt in response["body"]["results"]]
+        receipts = end_engine_roster(responses, getattr(self, "_isoexec_refusal_roster", None))
         receipts[0]["request_outputs"] = finish_requests(
             self,
             request_aliases=[trace["request_aliases"] for receipt in receipts for trace in receipt["trace"]],
             mismatch=any(r["verdict"] != "clean" for r in receipts),
         )
+        self._isoexec_refusal_roster = None
         return receipts
 
     async def sleep(self, level: int = 2, tags: Optional[List[str]] = None) -> Dict[str, Any]:

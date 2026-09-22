@@ -1,6 +1,7 @@
 """MTP weight selection, session ordering, and native draft endpoints."""
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -189,6 +190,7 @@ def _single_rank(monkeypatch, module):
     monkeypatch.setattr(module.torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(module.torch.distributed, "get_world_size", lambda: 1)
     monkeypatch.setattr(module.torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(module.torch.cuda, "device", lambda _: nullcontext())
 
 
 def test_broadcast_sender_starts_session_on_target(monkeypatch):
@@ -201,7 +203,7 @@ def test_broadcast_sender_starts_session_on_target(monkeypatch):
         init_info=BroadcastInitInfo(
             master_addr="127.0.0.1", master_port=1, rank_offset=1, world_size=2, override_existing_receiver=False
         ),
-        model_update_group=object(),
+        model_update_group=SimpleNamespace(device=0),
         inference_client=client,
     )
     metadata = {"names": ["mtp.fc.weight"], "dtype_names": ["bfloat16"], "shapes": [[2]]}
@@ -221,7 +223,7 @@ def test_broadcast_fp8_sender_starts_session_on_target(monkeypatch):
         init_info=BroadcastInitInfo(
             master_addr="127.0.0.1", master_port=1, rank_offset=1, world_size=2, override_existing_receiver=False
         ),
-        model_update_group=object(),
+        model_update_group=SimpleNamespace(device=0),
         inference_client=client,
     )
 
