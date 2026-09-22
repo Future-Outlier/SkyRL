@@ -84,12 +84,16 @@ def test_ipc_uses_metadata_from_the_handle_owning_gpu(monkeypatch, receiver_rank
     worker = SimpleNamespace(
         _skyrl_weight_update_active=True,
         _weight_update_active=True,
+        _weight_update_is_draft=False,
+        _skyrl_is_checkpoint_format=False,
         weight_transfer_engine=object(),
         device="cpu",
         vllm_config=None,
+        model_config=None,
         model_runner=SimpleNamespace(model=object()),
         _skyrl_load_kernel_weights=received.extend,
     )
+    worker.skyrl_weight_update_target = lambda: (worker.model_runner.model, worker.model_config)
     NewInferenceWorkerWrap.update_weights_ipc(worker, request)
     assert [name for name, _ in received] == [f"expert.{receiver_rank}"]
     assert received[0][1].tolist() == ([0, 1, 2, 3] if receiver_rank == 0 else [7, 9])
