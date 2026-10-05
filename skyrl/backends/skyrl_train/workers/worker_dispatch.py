@@ -595,7 +595,7 @@ class WorkerDispatch:
                     if state.model_on_gpu or state.optimizer_on_gpu:
                         self._offload_inactive_model(other)
 
-        kwargs = {"model_path": model_path}
+        kwargs: Dict[str, Any] = {"model_path": model_path}
         if num_training_steps is not None:
             kwargs["num_training_steps"] = num_training_steps
 
@@ -645,7 +645,7 @@ class WorkerDispatch:
             )
         )
 
-    def _broadcast_to_inference_engines(self, inference_engine_client, model_id: Optional[str] = None) -> None:
+    def _broadcast_to_inference_engines(self, inference_engine_client, model_id: Optional[str] = None) -> Any:
         """Broadcast policy weights to inference engines. Helper for save_weights_for_sampler.
 
         ``model_id`` is forwarded to the worker so that, on the LoRA path, the
@@ -657,7 +657,7 @@ class WorkerDispatch:
         # It carries the HF tokenizer (~10MB — 0.13s pickle driver-side, 0.34s
         # unpickle on EVERY worker), so shipping it per sync costs ~0.5s of the
         # sync wall even via ray.put (deref still deserializes per worker).
-        ray.get(
+        return ray.get(
             self._actor_groups["policy"].async_run_ray_method(
                 "pass_through",
                 "broadcast_to_inference_engines",
@@ -691,9 +691,12 @@ class WorkerDispatch:
             self.empty_cache("policy")
             return
 
-        is_sleeping = await self._inference_engine_client.is_sleeping()
+        client = self._inference_engine_client
+        if client is None:
+            raise RuntimeError("weight synchronization requires an inference engine client")
+        is_sleeping = await client.is_sleeping()
         if not is_sleeping:
-            await self._inference_engine_client.sleep()
+            await client.sleep()
 
         offload_optimizer = self.cfg.trainer.policy.optimizer_config.offload_after_step
         self._ensure_on_gpu(
@@ -730,7 +733,7 @@ class WorkerDispatch:
             and not policy_cfg.megatron_config.lora_config.merge_lora
         )
 
-    async def save_weights_for_sampler(self, model_id: Optional[str] = None) -> None:
+    async def save_weights_for_sampler(self, model_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Tinker API method to prepare updated parameters for sampling.
 
@@ -746,7 +749,15 @@ class WorkerDispatch:
                 "Pass inference_engine_client to WorkerDispatch constructor or call set_inference_engine_client()."
             )
 
+        if getattr(self.cfg.trainer, "enable_isoexec", False):
+            from isoexec.integrations.skyrl.fleet import save_v2_weights
+
+            if await save_v2_weights(self, self._inference_engine_client, model_id):
+                return
+
         adapter_only_sync = self.colocate_all and self._is_lora_no_merge()
+
+        producer_completions: Any = None
 
         def _broadcast_and_finish() -> None:
             """The weight transfer proper, timed on its own.
@@ -756,8 +767,11 @@ class WorkerDispatch:
             alongside the trainer's own ``sync_weights`` timer, which wraps the
             enclosing pause/resume bracket too.
             """
+            nonlocal producer_completions
             start = time.perf_counter()
-            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+            producer_completions = self._broadcast_to_inference_engines(
+                self._inference_engine_client, model_id=model_id
+            )
             self._finish_weight_sync(adapter_only_sync=adapter_only_sync)
             self.last_weight_sync_seconds = time.perf_counter() - start
 
@@ -822,4 +836,10 @@ class WorkerDispatch:
 
         # Advance the policy version so prefix-cache salting isolates blocks from the previous weights
         # (see `GeneratorConfig.use_cache_salt`).
+        verified_receipt = None
+        if getattr(self.cfg.trainer, "enable_isoexec", False):
+            from isoexec.integrations.skyrl.inference import finish_v1_weight_sync
+
+            verified_receipt = await finish_v1_weight_sync(self._inference_engine_client, producer_completions)
         self._inference_engine_client.increment_weight_version()
+        return verified_receipt

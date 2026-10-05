@@ -15,6 +15,11 @@ class WeightExtractor(ABC):
     handle sharding, and prepare them for transfer to inference engines.
     """
 
+    @property
+    def is_checkpoint_format(self) -> bool:
+        """Whether incoming names/storage require checkpoint loader processing."""
+        return True
+
     @abstractmethod
     def extract_weights(self, dtype: torch.dtype) -> Iterator[WeightChunk]:
         """Extract weights from the model as WeightChunk objects.

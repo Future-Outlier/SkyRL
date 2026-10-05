@@ -102,3 +102,25 @@ def test_vocab_entropy_auto_chunk_accounts_for_leading_dimensions():
 def test_vocab_entropy_chunk_resolver_rejects_invalid_values(chunk_size, memory_mb):
     with pytest.raises(ValueError):
         model_utils._resolve_vocab_entropy_chunk_size(torch.empty(1, 4, 8), chunk_size, memory_mb)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_real_vocab_entropy_ignores_negative_infinity_padding_in_forward_and_backward(monkeypatch, chunk_size):
+    monkeypatch.setattr(model_utils.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_utils.mpu, "get_tensor_model_parallel_group", lambda: None, raising=False)
+    monkeypatch.setattr(torch, "compile", lambda **kwargs: lambda fn: fn)
+    torch.manual_seed(17)
+    logits = torch.randn(1, 5, 7, dtype=torch.float64, requires_grad=True)
+    padded = torch.cat((logits.detach(), torch.full((1, 5, 3), -torch.inf)), dim=-1).requires_grad_()
+    original = padded.detach().clone()
+    expected = _local_entropy(logits)
+    actual = model_utils.vocab_parallel_entropy(padded, chunk_size=chunk_size)
+    weights = torch.linspace(0.25, 1.5, 5, dtype=torch.float64)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(actual, expected)
+    assert padded.grad is not None and logits.grad is not None
+    torch.testing.assert_close(padded.grad[..., :7], logits.grad)
+    assert torch.count_nonzero(padded.grad[..., 7:]) == 0
+    assert torch.isfinite(padded.grad).all()
+    assert torch.equal(padded.detach(), original)

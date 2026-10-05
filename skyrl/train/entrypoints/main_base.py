@@ -65,14 +65,18 @@ class BasePPOExp:
         """
         self.cfg = cfg
         tokenizer_options = {}
+        tokenizer_path = cfg.trainer.policy.model.path
         if cfg.trainer.enable_isoexec:
             from isoexec.integrations.skyrl.config import resolve
 
             resolved = resolve(cfg)
+            if resolved is None:
+                raise RuntimeError("Enabled IsoExec configuration did not resolve")
+            tokenizer_path = resolved.tokenizer_path or cfg.trainer.policy.model.path
             if resolved.model_revision is not None:
                 tokenizer_options["revision"] = resolved.model_revision
         self.tokenizer = get_tokenizer(
-            self.cfg.trainer.policy.model.path,
+            tokenizer_path,
             trust_remote_code=True,
             use_fast=not self.cfg.trainer.disable_fast_tokenizer,
             padding_side="left",

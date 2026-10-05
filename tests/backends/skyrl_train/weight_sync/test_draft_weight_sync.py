@@ -1,13 +1,18 @@
 """MTP weight selection, session ordering, and native draft endpoints."""
 
 import asyncio
+from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
 from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
     LayerwiseReloadWorkerMixin,
+)
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+    RemoteInferenceClient,
 )
 from skyrl.backends.skyrl_train.weight_sync import (
     WEIGHT_UPDATE_TARGET_DRAFT,
@@ -156,9 +161,14 @@ class TestSenderSessions:
                 WEIGHT_UPDATE_TARGET_MODEL,
                 ["model.embed_tokens.weight", "model.layers.0.w"],
                 ["model.embed_tokens.weight", "model.layers.0.w"],
-                {"reset_prefix_cache": True},
+                {"reset_prefix_cache": True, "is_checkpoint_format": True},
             ),
-            (WEIGHT_UPDATE_TARGET_DRAFT, ["mtp.fc.weight"], ["mtp.fc.weight"], {"reset_prefix_cache": True}),
+            (
+                WEIGHT_UPDATE_TARGET_DRAFT,
+                ["mtp.fc.weight"],
+                ["mtp.fc.weight"],
+                {"reset_prefix_cache": True, "is_checkpoint_format": True},
+            ),
         ]
 
     def test_extractor_without_draft_weights_fails_loud(self):
@@ -191,24 +201,41 @@ def _single_rank(monkeypatch, module):
     monkeypatch.setattr(module.torch.distributed, "barrier", lambda: None)
 
 
+def _cpu_communicator_boundary(monkeypatch, module):
+    """Observe the sender's native-owned device selection without opening CUDA."""
+    selected = []
+    device = torch.device("cuda", 3)
+
+    @contextmanager
+    def owned_device(value):
+        assert value == device
+        selected.append(value)
+        yield
+
+    monkeypatch.setattr(module.torch.cuda, "device", owned_device)
+    return SimpleNamespace(device=device), selected
+
+
 def test_broadcast_sender_starts_session_on_target(monkeypatch):
     import skyrl.backends.skyrl_train.weight_sync.broadcast_strategy as broadcast_module
 
     _single_rank(monkeypatch, broadcast_module)
     monkeypatch.setattr(broadcast_module, "nccl_trainer_send_weights", lambda it, group, *, packed: list(it))
     client = _FakeClient()
+    communicator, selected = _cpu_communicator_boundary(monkeypatch, broadcast_module)
     sender = BroadcastWeightTransferSender(
         init_info=BroadcastInitInfo(
             master_addr="127.0.0.1", master_port=1, rank_offset=1, world_size=2, override_existing_receiver=False
         ),
-        model_update_group=object(),
-        inference_client=client,
+        model_update_group=communicator,
+        inference_client=cast(RemoteInferenceClient, client),
     )
     metadata = {"names": ["mtp.fc.weight"], "dtype_names": ["bfloat16"], "shapes": [[2]]}
 
     asyncio.run(sender.send_chunks(iter([_chunk("mtp.fc.weight")]), weight_metadata=metadata, target="draft"))
 
     assert client.events == [("start", "draft"), ("nccl", ["mtp.fc.weight"]), ("finish", "draft")]
+    assert selected == [communicator.device]
 
 
 def test_broadcast_fp8_sender_starts_session_on_target(monkeypatch):
@@ -217,32 +244,35 @@ def test_broadcast_fp8_sender_starts_session_on_target(monkeypatch):
     _single_rank(monkeypatch, broadcast_module)
     monkeypatch.setattr(broadcast_module, "nccl_trainer_send_weights", lambda it, group, *, packed: list(it))
     client = _FakeClient()
+    communicator, selected = _cpu_communicator_boundary(monkeypatch, broadcast_module)
     sender = BroadcastWeightTransferSender(
         init_info=BroadcastInitInfo(
             master_addr="127.0.0.1", master_port=1, rank_offset=1, world_size=2, override_existing_receiver=False
         ),
-        model_update_group=object(),
-        inference_client=client,
+        model_update_group=communicator,
+        inference_client=cast(RemoteInferenceClient, client),
     )
 
     asyncio.run(sender.send_chunks(iter([_chunk("mtp.fc.weight")]), derive_metadata_from_chunks=True, target="draft"))
 
     assert client.events == [("start", "draft"), ("nccl", ["mtp.fc.weight"]), ("finish", "draft")]
+    assert selected == [communicator.device]
 
 
 def test_cuda_ipc_sender_forwards_target(monkeypatch):
     sender = CudaIpcWeightTransferSender(
         init_info=CudaIpcInitInfo(override_existing_receiver=False, model_dtype_str="bfloat16"),
-        inference_client=_FakeClient(),
+        inference_client=cast(RemoteInferenceClient, _FakeClient()),
     )
     calls = []
 
-    async def record(chunks, weight_metadata=None, target="model"):
-        calls.append((list(chunks), target))
+    async def record(chunks, weight_metadata=None, target="model", *, is_checkpoint_format=True):
+        calls.append((list(chunks), target, is_checkpoint_format))
 
     monkeypatch.setattr(sender, "_send_chunks_vllm_native", record)
     asyncio.run(sender.send_chunks(iter([]), target="draft"))
-    assert calls == [([], "draft")]
+    asyncio.run(sender.send_chunks(iter([]), target="draft", is_checkpoint_format=False))
+    assert calls == [([], "draft", True), ([], "draft", False)]
 
 
 def test_delta_sender_rejects_draft_target():
@@ -254,7 +284,7 @@ def test_delta_sender_rejects_draft_target():
             local_checkpoint_dir="/tmp/local",
             publish_staging_dir="/tmp/staging",
         ),
-        inference_client=object(),
+        inference_client=cast(RemoteInferenceClient, object()),
     )
     with pytest.raises(ValueError, match="Delta weight sync cannot sync spec-decode draft weights"):
         asyncio.run(sender.send_chunks(iter([]), target="draft"))
@@ -275,7 +305,7 @@ def test_native_draft_session_target():
     worker = LayerwiseReloadWorkerMixin()
     worker._weight_update_active = True
     worker._weight_update_is_draft = True
-    worker.weight_transfer_engine = SimpleNamespace(model=model, model_config=config)
+    vars(worker)["weight_transfer_engine"] = SimpleNamespace(model=model, model_config=config)
     assert worker.skyrl_weight_update_target() == (model, config)
     worker._weight_update_active = False
     with pytest.raises(RuntimeError, match="start_weight_update"):
@@ -288,10 +318,11 @@ def test_model_session_after_native_draft_session(monkeypatch):
     monkeypatch.setattr(layerwise_reload, "_PATCHED_LAYERWISE_NUMEL_LOADED", True)
     worker = LayerwiseReloadWorkerMixin()
     worker._weight_update_is_draft = True
-    worker.model_runner = SimpleNamespace(model=object())
-    worker.model_config = object()
+    runner, config = SimpleNamespace(model=object()), object()
+    monkeypatch.setattr(worker, "model_runner", runner, raising=False)
+    monkeypatch.setattr(worker, "model_config", config, raising=False)
     worker.skyrl_start_weight_update(is_checkpoint_format=False)
-    assert worker.skyrl_weight_update_target() == (worker.model_runner.model, worker.model_config)
+    assert worker.skyrl_weight_update_target() == (runner.model, config)
     worker.skyrl_finish_weight_update()
 
 

@@ -1232,7 +1232,8 @@ class AllGatherPackedCPTensor(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, *grad_outputs):
+        (grad_output,) = grad_outputs
         cp_size = torch.distributed.get_world_size(ctx.cp_group)
         cp_rank = torch.distributed.get_rank(ctx.cp_group)
         (cu_seqlens_padded,) = ctx.saved_tensors
@@ -1251,6 +1252,7 @@ class AllGatherPackedCPTensor(torch.autograd.Function):
 
 
 class AllGatherCPTensor(torch.autograd.Function):
+    @staticmethod
     def forward(
         ctx, tensor, cp_group: torch.distributed.ProcessGroup, seq_dim=1
     ):  # , unpadded_seqlen: Optional[int] = None):
@@ -1282,7 +1284,9 @@ class AllGatherCPTensor(torch.autograd.Function):
 
         return ret_tensor
 
-    def backward(ctx, grad_output):
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        (grad_output,) = grad_outputs
         cp_size = torch.distributed.get_world_size(ctx.cp_group)
         cp_rank = torch.distributed.get_rank(ctx.cp_group)
         torch.distributed.all_reduce(grad_output, group=ctx.cp_group)
@@ -1318,6 +1322,9 @@ class _VocabParallelEntropy(torch.autograd.Function):
     def forward(ctx, vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
         @torch.compile(dynamic=True)
         def mul_reduce(a, b):
+            # Vocabulary padding has logit -inf and probability zero: its entropy term is zero.
+            # Keep NaN/+inf visible so invalid real logits are not silently accepted.
+            b = b.masked_fill(torch.isneginf(b), 0)
             return (a * b).sum(dim=-1, keepdim=True)
 
         logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
@@ -1334,13 +1341,15 @@ class _VocabParallelEntropy(torch.autograd.Function):
         return entropy.squeeze(dim=-1)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+    def backward(ctx, *grad_outputs: torch.Tensor) -> torch.Tensor:
+        (grad_output,) = grad_outputs
         vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
         # grad = softmax * (sum_softmax_times_logits - vocab_parallel_logits) * grad_output
         # NOTE: do NOT mutate vocab_parallel_logits in-place. The same logits tensor may also
         # be saved for backward by ChunkedDistributedLogprob; even the "sub_ then add_" restore
         # pattern bumps the storage version counter and trips that Function's version check.
-        softmax_logits.mul_(sum_softmax_times_logits - vocab_parallel_logits)
+        finite_padding_logits = vocab_parallel_logits.masked_fill(torch.isneginf(vocab_parallel_logits), 0)
+        softmax_logits.mul_(sum_softmax_times_logits - finite_padding_logits)
         softmax_logits.mul_(grad_output.unsqueeze(dim=-1))
         return softmax_logits
 

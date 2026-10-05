@@ -1,13 +1,13 @@
 from dataclasses import asdict
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol, cast
 
 import megatron.core.parallel_state as mpu
 import torch
 import torch.nn as nn
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from skyrl.backends.skyrl_train.distributed.megatron.fused_lm_head import (
     call_model_with_fused_lm_head,
@@ -31,6 +31,9 @@ from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
     vocab_parallel_entropy,
     vocab_parallel_entropy_packed_sequences,
+)
+from skyrl.backends.skyrl_train.distributed.megatron.packing_utils import (
+    should_pack_root_inputs,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
     is_fp8_enabled,
@@ -61,7 +64,11 @@ from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     compute_minibatch_rollout_logprob_diff_metrics,
 )
-from skyrl.train.config import TrainerConfig
+from skyrl.train.config import AlgorithmConfig, TrainerConfig
+
+
+class _LossScaler(Protocol):
+    def scale_loss(self, loss: torch.Tensor) -> torch.Tensor: ...
 
 
 def _build_packed_targets(
@@ -158,7 +165,7 @@ class MegatronModelWrapper:
         self,
         config: TrainerConfig,
         actor_module: List[nn.Module],
-        actor_optimizer: Optional[torch.optim.Optimizer] = None,
+        actor_optimizer: Optional[_LossScaler] = None,
         policy_loss_fn: Optional[Callable] = None,
         is_vlm: bool = False,
     ):
@@ -193,26 +200,26 @@ class MegatronModelWrapper:
         # by `run_pending_grad_sync`. See those methods for why the sync is deferred.
         self._pending_grad_sync: Optional[dict] = None
 
-        config = get_model_config(self.actor_module[0])
+        model_config = get_model_config(self.actor_module[0])
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
         # use the built-in finalize_model_grads function to all reduce gradients across
         # parallelism dimensions -- but deferred to optim_step rather than run per
         # forward_backward. See `_defer_finalize_model_grads`.
         self._finalize_model_grads = (
-            config.finalize_model_grads_func
-            if getattr(self.cfg, "enable_isoexec", False) and config.finalize_model_grads_func is not None
+            model_config.finalize_model_grads_func
+            if getattr(self.cfg, "enable_isoexec", False) and model_config.finalize_model_grads_func is not None
             else finalize_model_grads
         )
-        config.finalize_model_grads_func = self._defer_finalize_model_grads
+        model_config.finalize_model_grads_func = self._defer_finalize_model_grads
         # Wire up the optimizer's loss scaler so Megatron's pipeline schedule can scale
         # the loss before backward (critical for fp16 dynamic loss scaling, MoE aux loss
         # scaling, and any explicit loss_scale configuration).
         if actor_optimizer is not None:
-            config.grad_scale_func = actor_optimizer.scale_loss
+            model_config.grad_scale_func = actor_optimizer.scale_loss
         if getattr(self.cfg, "enable_isoexec", False):
             from isoexec.integrations.skyrl.scoring import bind as bind_isoexec_scoring
 
-            bind_isoexec_scoring(self, config)
+            bind_isoexec_scoring(self, model_config)
 
     def _defer_finalize_model_grads(self, model, num_tokens=None, **kwargs) -> None:
         """Record Megatron's end-of-schedule grad sync instead of running it.
@@ -300,7 +307,7 @@ class MegatronModelWrapper:
             expected = data.get("rollout_full_logprobs")
             packed_seq_params = data.get("packed_seq_params")
             packed_targets = data.get("packed_targets")
-            tp_grp = mpu.get_tensor_model_parallel_group()
+            tp_grp = cast(torch.distributed.ProcessGroup, mpu.get_tensor_model_parallel_group())
             tp_rank = mpu.get_tensor_model_parallel_rank()
 
             # Fused LM-head: `logits` is actually decoder hidden states [B, S, H]
@@ -311,9 +318,9 @@ class MegatronModelWrapper:
             if expected is not None and not getattr(self.cfg, "enable_isoexec", False):
                 raise ValueError("Full logprob comparison requires trainer.enable_isoexec=true")
             lm_head_weight = data.get("lm_head_weight")
-            if fused_lm_head:
-                _v_local = int(lm_head_weight.shape[0])
-                fused_vocab_start, fused_vocab_end = tp_rank * _v_local, (tp_rank + 1) * _v_local
+            # Bounds are read only by the fused branches below.
+            fused_vocab_start = tp_rank * int(lm_head_weight.shape[0]) if fused_lm_head else 0
+            fused_vocab_end = (tp_rank + 1) * int(lm_head_weight.shape[0]) if fused_lm_head else 0
 
             # temperature normalization (the fused path applies it inside the op)
             if self._scale_logits is not None and not fused_lm_head:
@@ -332,7 +339,7 @@ class MegatronModelWrapper:
                     vocab_end_index=fused_vocab_end,
                     group=tp_grp,
                     inference_only=True,
-                    cp_group=mpu.get_context_parallel_group(),
+                    cp_group=cast(torch.distributed.ProcessGroup, mpu.get_context_parallel_group()),
                     chunk_size=self.cfg.logprobs_chunk_size,
                     attention_mask=data["attention_mask"],
                     sub_seq_lengths=data.get("sub_seq_lengths_list"),
@@ -364,7 +371,7 @@ class MegatronModelWrapper:
                     vocab_end_index=(tp_rank + 1) * logits.shape[-1],
                     group=tp_grp,
                     inference_only=True,
-                    cp_group=mpu.get_context_parallel_group(),
+                    cp_group=cast(torch.distributed.ProcessGroup, mpu.get_context_parallel_group()),
                     chunk_size=self.cfg.logprobs_chunk_size,
                     attention_mask=data["attention_mask"],
                     sub_seq_lengths=data.get("sub_seq_lengths_list"),
@@ -415,7 +422,11 @@ class MegatronModelWrapper:
                 new_sequences, packed_seq_params = preprocess_packed_seqs(
                     sequences,
                     attention_mask,
-                    pre_process=mpu.is_pipeline_first_stage(ignore_virtual=True) or self.is_vlm,
+                    pre_process=should_pack_root_inputs(
+                        is_pipeline_first_stage=mpu.is_pipeline_first_stage(ignore_virtual=True),
+                        is_vlm=self.is_vlm,
+                        requires_packed_root_inputs=getattr(model_config, "requires_packed_root_inputs", False),
+                    ),
                     sub_seq_lengths=sub_seq_lengths,
                     fp8_enabled=fp8_enabled,
                     fp8_recipe=fp8_recipe,
@@ -453,6 +464,7 @@ class MegatronModelWrapper:
 
             model_replay_kwargs = {}
             if rollout_expert_indices is not None:
+                assert metadata_layout is not None
                 model_replay_kwargs = setup_per_microbatch_replay_forward(
                     rollout_expert_indices,
                     router_padding_mask,
@@ -496,6 +508,7 @@ class MegatronModelWrapper:
                 )
 
             if not self.remove_microbatch_padding:
+                assert new_attention_mask is not None
                 outputs = recover_left_padding(
                     outputs,
                     new_attention_mask,
@@ -607,8 +620,9 @@ class MegatronModelWrapper:
         loss_config = self.cfg.algorithm
         if loss_fn_config:
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(loss_fn_config))
+            assert isinstance(new_loss_config, DictConfig)
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
-            loss_config = type(loss_config).from_dict_config(new_loss_config)
+            loss_config = cast(AlgorithmConfig, type(loss_config).from_dict_config(new_loss_config))
 
         def loss_func(logits, data):
             sequences = data["sequences"]
@@ -629,7 +643,7 @@ class MegatronModelWrapper:
             num_real_microbatches = data.get("num_real_microbatches", num_microbatches)
 
             dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-            tp_grp = mpu.get_tensor_model_parallel_group()
+            tp_grp = cast(torch.distributed.ProcessGroup, mpu.get_tensor_model_parallel_group())
             tp_rank = mpu.get_tensor_model_parallel_rank()
 
             # Fused LM-head: `logits` is actually decoder hidden states [B, S, H]
@@ -643,9 +657,9 @@ class MegatronModelWrapper:
                     "fused_lm_head_logprob does not support use_entropy_loss=True "
                     "(the fused entropy is a no-grad metric)."
                 )
-            if fused_lm_head:
-                _v_local = int(lm_head_weight.shape[0])
-                fused_vocab_start, fused_vocab_end = tp_rank * _v_local, (tp_rank + 1) * _v_local
+            # Bounds are read only by the fused branches below.
+            fused_vocab_start = tp_rank * int(lm_head_weight.shape[0]) if fused_lm_head else 0
+            fused_vocab_end = (tp_rank + 1) * int(lm_head_weight.shape[0]) if fused_lm_head else 0
 
             # temperature normalization (the fused path applies it inside the op). A bound
             # scaler (IsoExec) divides by a float32 tensor exactly as the rollout sampler does;
@@ -667,7 +681,7 @@ class MegatronModelWrapper:
                     vocab_end_index=fused_vocab_end,
                     group=tp_grp,
                     inference_only=False,
-                    cp_group=mpu.get_context_parallel_group(),
+                    cp_group=cast(torch.distributed.ProcessGroup, mpu.get_context_parallel_group()),
                     chunk_size=self.cfg.logprobs_chunk_size,
                     attention_mask=data["attention_mask"],
                     sub_seq_lengths=data.get("sub_seq_lengths_list"),
@@ -702,7 +716,7 @@ class MegatronModelWrapper:
                     vocab_end_index=(tp_rank + 1) * logits.shape[-1],
                     group=tp_grp,
                     inference_only=False,
-                    cp_group=mpu.get_context_parallel_group(),
+                    cp_group=cast(torch.distributed.ProcessGroup, mpu.get_context_parallel_group()),
                     chunk_size=self.cfg.logprobs_chunk_size,
                     attention_mask=data["attention_mask"],
                     sub_seq_lengths=data.get("sub_seq_lengths_list"),
@@ -722,6 +736,8 @@ class MegatronModelWrapper:
             action_log_probs = token_logprobs[:, -num_actions:]
 
             # policy loss should be calculated based on the selected token logprobs
+            if current_loss_fn is None:
+                raise ValueError("forward_backward_mini_batch requires a policy loss function")
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
@@ -874,7 +890,7 @@ class MegatronModelWrapper:
                         num_actions,
                         data["attention_mask"],
                         loss_mask,
-                        mpu.get_context_parallel_group(),
+                        cast(torch.distributed.ProcessGroup, mpu.get_context_parallel_group()),
                         tp_group=tp_grp,
                         sub_seq_lengths=data.get("sub_seq_lengths_list"),
                         chunk_size=self.cfg.logprobs_chunk_size,
@@ -899,7 +915,7 @@ class MegatronModelWrapper:
                         num_actions,
                         data["attention_mask"],
                         loss_mask,
-                        mpu.get_context_parallel_group(),
+                        cast(torch.distributed.ProcessGroup, mpu.get_context_parallel_group()),
                         sub_seq_lengths=data.get("sub_seq_lengths_list"),
                         chunk_size=self.cfg.vocab_entropy_chunk_size,
                         chunk_memory_mb=self.cfg.vocab_entropy_chunk_memory_mb,
@@ -1040,7 +1056,11 @@ class MegatronModelWrapper:
                 new_sequences, packed_seq_params = preprocess_packed_seqs(
                     sequences,
                     attention_mask,
-                    pre_process=mpu.is_pipeline_first_stage(ignore_virtual=True) or self.is_vlm,
+                    pre_process=should_pack_root_inputs(
+                        is_pipeline_first_stage=mpu.is_pipeline_first_stage(ignore_virtual=True),
+                        is_vlm=self.is_vlm,
+                        requires_packed_root_inputs=getattr(model_config, "requires_packed_root_inputs", False),
+                    ),
                     sub_seq_lengths=sub_seq_lengths,
                     fp8_enabled=fp8_enabled,
                     fp8_recipe=fp8_recipe,
@@ -1091,6 +1111,7 @@ class MegatronModelWrapper:
 
             model_replay_kwargs = {}
             if rollout_expert_indices is not None:
+                assert metadata_layout is not None
                 model_replay_kwargs = setup_per_microbatch_replay_forward(
                     rollout_expert_indices,
                     router_padding_mask,
@@ -1108,6 +1129,7 @@ class MegatronModelWrapper:
             # [batch, seq, vocab] without packing, packed [1, T, vocab] with it — so the two always
             # align (see the packed-aware mask in loss_func / mtp/soft_ce.py).
             def depad(tensor):
+                assert new_attention_mask is not None
                 return recover_left_padding(
                     tensor,
                     new_attention_mask,
@@ -1155,7 +1177,7 @@ class MegatronModelWrapper:
                         output_processor=fused_lm_head_output_processor,
                         output_processor_context=_op_ctx,
                         **self._forward_kwargs,
-                    **model_replay_kwargs,
+                        **model_replay_kwargs,
                         **vlm_inputs,
                     )
                     batch["lm_head_weight"] = _op_ctx.get("lm_head_weight")
@@ -1166,7 +1188,7 @@ class MegatronModelWrapper:
                         to_te_attention_mask(new_attention_mask),
                         packed_seq_params=packed_seq_params,
                         **self._forward_kwargs,
-                    **model_replay_kwargs,
+                        **model_replay_kwargs,
                         **vlm_inputs,
                     )
                 # Replay the MTP block on *detached* trunk hidden states (decoupled draft forward)
@@ -1222,7 +1244,7 @@ class MegatronModelWrapper:
             torch.distributed.broadcast_object_list(
                 metrics_list,
                 src=mpu.get_pipeline_model_parallel_last_rank(),
-                group=mpu.get_pipeline_model_parallel_group(),
+                group=cast(torch.distributed.ProcessGroup, mpu.get_pipeline_model_parallel_group()),
             )
 
-        return metrics_list
+        return cast(List[dict], metrics_list)

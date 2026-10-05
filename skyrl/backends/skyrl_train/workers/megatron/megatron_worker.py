@@ -3,7 +3,7 @@ import os
 import shutil
 from collections import defaultdict
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union, cast
 
 import megatron.core.parallel_state as mpu
 import ray
@@ -15,10 +15,9 @@ from loguru import logger
 from megatron.bridge import AutoBridge
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 from megatron.bridge.peft.lora import LoRA
-from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
-from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.optimizer import ChainedOptimizer
 from omegaconf import OmegaConf
-from transformers import AutoConfig
+from transformers import AutoConfig, PreTrainedTokenizerBase
 
 import skyrl.backends.skyrl_train.workers.megatron.model_bridges  # noqa: F401  # register extra bridges
 from skyrl.backends.skyrl_train.distributed.dispatch import MeshRank, WorkerOutput
@@ -181,7 +180,7 @@ class MegatronWeightExtractor(WeightExtractor):
         # so param.numel()==0 and bucketing collapses to a single bucket.
         # By the time extract_weights runs, the dispatch has already
         # called prepare_for_weight_sync → _ensure_on_gpu.
-        self.bucket_index_groups = None
+        self.bucket_index_groups: Optional[list[list[int]]] = None
         self._buckets_initialized = False
 
     def _init_param_buckets(self):
@@ -244,7 +243,7 @@ class MegatronWeightExtractor(WeightExtractor):
         # FusedExpertMapping for MoE expert weights) must ALL be present in a single
         # export_hf_weights call for the bridge's _accumulate_grouped_export to produce
         # the fused tensor.  Collect them by group_key and give each group its own bucket.
-        grouped_task_indices: dict[str, list[int]] = {}  # group_key -> list of task indices
+        grouped_task_indices: dict[object, list[int]] = {}  # group_key -> list of task indices
         regular_task_indices: list[int] = []
 
         for idx, task in enumerate(weight_conversion_tasks):
@@ -262,14 +261,14 @@ class MegatronWeightExtractor(WeightExtractor):
             else:
                 regular_task_indices.append(idx)
 
-        self.bucket_index_groups: list[list[int]] = []
+        self.bucket_index_groups = []
 
         # Pack grouped-export tasks into buckets by size, keeping each
         # group_key's tasks together (they must not be split across calls).
         curr_size = 0
         threshold = self.bucket_size_threshold_GB * 1024**3
         for gk, indices in grouped_task_indices.items():
-            group_size = sum(sizes[idx] for idx in indices if sizes[idx] is not None)
+            group_size = sum(size for idx in indices if (size := sizes[idx]) is not None)
             if not self.bucket_index_groups or curr_size + group_size > threshold:
                 self.bucket_index_groups.append([])
                 curr_size = 0
@@ -282,6 +281,7 @@ class MegatronWeightExtractor(WeightExtractor):
             curr_size = 0
             for idx in regular_task_indices:
                 size = sizes[idx]
+                assert size is not None
                 if curr_size + size > threshold:
                     self.bucket_index_groups.append([])
                     curr_size = 0
@@ -355,6 +355,7 @@ class MegatronWeightExtractor(WeightExtractor):
             # Build fresh tasks each sync so mapping objects have clean
             # PP-collective caches; reuse the pre-computed bucket structure.
             fresh_tasks = self.bridge.get_conversion_tasks(self.actor_module)
+            assert self.bucket_index_groups is not None
             for index_group in self.bucket_index_groups:
                 bucket_tasks = [fresh_tasks[i] for i in index_group]
                 for name, tensor in self.bridge.export_hf_weights(
@@ -431,6 +432,7 @@ class MegatronWeightExtractor(WeightExtractor):
             # PP-collective caches; reuse the pre-computed bucket structure.
             fresh_tasks = self.bridge.get_conversion_tasks(self.actor_module)
 
+            assert self.bucket_index_groups is not None
             for index_group in self.bucket_index_groups:
                 bucket_tasks = [fresh_tasks[i] for i in index_group]
                 hf_params_generator = self.bridge.export_hf_weights(
@@ -466,6 +468,16 @@ class MegatronWeightExtractor(WeightExtractor):
 
 
 class MegatronWorker:
+    # Concrete policy/ref workers supply backend wrappers after initialization.
+    # These differ from the Torch module/optimizer types in the generic bases.
+    cfg: Any
+    strategy: Any
+    model: Any
+    actor_module: Any
+    scheduler: Any
+    optimizer: Any
+    provider: Any
+
     def _maybe_setup_fake_int4_qat(self):
         """Wire up INT4-served training and return the BF16 bridge-weights path.
 
@@ -534,7 +546,7 @@ class MegatronWorker:
         masters and fake-quantizes them in the forward pass. Tokenizer + HF config
         (the logical model identity) still come from ``model_path``.
         """
-        tokenizer = get_tokenizer(model_path, trust_remote_code=True)
+        tokenizer = cast(PreTrainedTokenizerBase, get_tokenizer(model_path, trust_remote_code=True))
         hf_config_original = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
         if not language_model_only:
@@ -568,6 +580,9 @@ class MegatronWorker:
             if isinstance(transformer_config_kwargs, dict)
             else OmegaConf.to_container(transformer_config_kwargs, resolve=True)
         )
+        if not isinstance(transformer_config_kwargs, dict):
+            raise TypeError("Megatron transformer config overrides must be a mapping")
+        transformer_config_kwargs = cast(Dict[str, Any], transformer_config_kwargs)
         # validate_megatron_cfg resolves fp8_recipe="auto" on the driver when it
         # can see a GPU; a GPU-less driver ships "auto" through unresolved. The
         # worker always has the target device visible, so resolve here and
@@ -618,7 +633,9 @@ class MegatronWorker:
 
         # Defer persistent-FP8 checkpoint import until the bridge can expose
         # unquantized converted shards for optimizer-master initialization.
-        provider = bridge.to_megatron_provider(load_weights=not fp8_param_enabled)
+        # AutoBridge returns architecture-specific providers beyond its common
+        # GPT annotation; the selected provider owns these extension fields.
+        provider = cast(Any, bridge.to_megatron_provider(load_weights=not fp8_param_enabled))
         if fp8_param_enabled:
             provider.perform_initialization = False
 
@@ -669,6 +686,8 @@ class MegatronWorker:
 
         # Apply any additional transformer config kwargs (can override the above).
         for k, v in transformer_config_kwargs.items():
+            if not isinstance(k, str):
+                raise TypeError("Megatron transformer config override names must be strings")
             setattr(provider, k, v)
 
         # megatron bridge resolves the HF config's `layer_types` into an explicit per-layer list
@@ -927,7 +946,7 @@ class MegatronWorker:
             micro_batches = data.chunk(self.cfg.micro_forward_batch_size_per_gpu)
 
         for micro in micro_batches:
-            attention_mask = micro["attention_mask"]
+            attention_mask = cast(torch.Tensor, micro["attention_mask"])
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
             rollout_expert_indices = micro.get("rollout_expert_indices")
@@ -942,7 +961,7 @@ class MegatronWorker:
                 "sequences": micro["sequences"],
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
-                "num_actions": micro.metadata["response_length"],
+                "num_actions": cast(dict[str, Any], micro.metadata)["response_length"],
                 "rollout_expert_indices": (rollout_expert_indices if self.enable_router_replay else None),
                 "router_padding_mask": micro.get("router_padding_mask") if self.enable_router_replay else None,
                 "sub_seq_lengths": micro.get("sub_seq_lengths"),
@@ -991,7 +1010,7 @@ class MegatronWorker:
             output = TrainingOutputBatch({"output": log_probs})
             output.metadata = data.metadata
 
-        return output["output"]
+        return cast(torch.Tensor, output["output"])
 
     def _reorder_megatron_forward_output(
         self, output: TrainingOutputBatch, microbatch_iterator, micro_dicts, padded_mbs
@@ -1007,7 +1026,7 @@ class MegatronWorker:
         if not mpu.is_pipeline_last_stage(ignore_virtual=True):
             return output
 
-        log_probs = output["output"]  # shape: [total_padded_samples, num_actions]
+        log_probs = cast(torch.Tensor, output["output"])  # shape: [total_padded_samples, num_actions]
 
         # Split by padded_mbs, take only real samples, reorder
         all_log_probs = log_probs.split(padded_mbs, dim=0)
@@ -1119,10 +1138,10 @@ class MegatronWorker:
 class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.model: MegatronModelWrapper = None
-        self.actor_module: List[nn.Module] = None
-        self.scheduler: OptimizerParamScheduler = None
-        self.optimizer: DistributedOptimizer = None
+        self.model = None
+        self.actor_module = None
+        self.scheduler = None
+        self.optimizer = None
         # Worker base owns self.profiler; init_model may populate it.
         self._is_lora = self.cfg.policy.model.lora.rank > 0
         # Per-worker store of LoRA adapter snapshots. Allocated only for the
@@ -1156,7 +1175,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     return _orig_broadcast(*args, **kwargs)
 
             torch.distributed.broadcast = _broadcast_no_grad
-            torch.distributed._skyrl_broadcast_no_grad_patched = True
+            setattr(torch.distributed, "_skyrl_broadcast_no_grad_patched", True)
 
         self.strategy = MegatronStrategy(
             megatron_config=self.cfg.policy.megatron_config,
@@ -1182,7 +1201,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             pp_size=mpu.get_pipeline_model_parallel_world_size(),
         )
 
-    def init_model(self, model_path, num_training_steps: int = 1e9):
+    def init_model(self, model_path, num_training_steps: int = 1_000_000_000):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
@@ -1256,7 +1275,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             optim_config = init_megatron_optim_config(
                 self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
             )
-            self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+            self.optimizer = cast(Any, get_megatron_optimizer(self.actor_module, optim_config))
             fp8_param_masters = initialize_fp8_param_optimizer_masters(
                 self.optimizer,
                 fp8_param=is_fp8_param_enabled(self.cfg.policy.megatron_config.transformer_config_kwargs),
@@ -1269,10 +1288,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     fp8_param_masters,
                 )
             # create scheduler
-            self.scheduler = get_megatron_optimizer_param_scheduler(
-                optimizer=self.optimizer,
-                config=self.cfg.policy.optimizer_config,
-                num_training_steps=num_training_steps,
+            self.scheduler = cast(
+                Any,
+                get_megatron_optimizer_param_scheduler(
+                    optimizer=self.optimizer,
+                    config=self.cfg.policy.optimizer_config,
+                    num_training_steps=num_training_steps,
+                ),
             )
 
             if getattr(self.provider, "mtp_num_layers", None):
@@ -1289,12 +1311,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         self._release_fp8_param_unquantized_state()
 
         # create worker model
-        self.model = MegatronModelWrapper(
-            config=self.cfg,
-            actor_module=self.actor_module,
-            actor_optimizer=self.optimizer,
-            policy_loss_fn=self.policy_loss_fn,
-            is_vlm=self.is_vlm,
+        self.model = cast(
+            Any,
+            MegatronModelWrapper(
+                config=self.cfg,
+                actor_module=self.actor_module,
+                actor_optimizer=self.optimizer,
+                policy_loss_fn=self.policy_loss_fn,
+                is_vlm=self.is_vlm,
+            ),
         )
 
         self.empty_cuda_cache = self.cfg.policy.megatron_config.empty_cuda_cache
@@ -1345,6 +1370,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         for experience in BatchIterator(data, micro_batch_size, drop_last=False):
             sequences = experience.sequences
             attention_mask = experience.attention_mask
+            assert attention_mask is not None
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
             rollout_expert_indices = experience.rollout_expert_indices
@@ -1470,6 +1496,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         for experience in experiences:
             attention_mask = experience.attention_mask
+            assert attention_mask is not None
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
             rollout_expert_indices = experience.rollout_expert_indices
@@ -1619,7 +1646,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
-    def optim_step(self) -> Optional[float]:
+    def optim_step(self) -> Any:
         """
         Perform optimizer step.
 
@@ -1644,11 +1671,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # spans more than one call.
         self.model.run_pending_grad_sync()
 
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
         if self.cfg.enable_isoexec:
-            from isoexec.integrations.skyrl.megatron import finish_optimizer_step
+            from isoexec.integrations.skyrl.megatron import optimizer_step
 
-            finish_optimizer_step(self)
+            grad_norm = optimizer_step(self)
+        else:
+            grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         # Clear the DDP grad buffers for the next window. `optimizer.zero_grad()` inside
         # `optimizer_step` only drops `param.grad` / the fp32 main-param grads -- the
@@ -1752,10 +1780,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 # Written before the gather so every rank checks after it exists.
                 os.makedirs(base_sync_path, exist_ok=True)
                 with open(probe_path, "w", encoding="utf-8") as f:
+                    assert token is not None
                     f.write(token)
 
             infos = [None] * torch.distributed.get_world_size()
             torch.distributed.all_gather_object(infos, (socket.gethostname(), token))
+            infos = cast(list[tuple[str, Optional[str]]], infos)
             hostnames = [host for host, _ in infos]
             node_leader = hostnames.index(hostnames[rank]) == rank
 
@@ -1902,7 +1932,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             "sync_draft_weights": needs_draft_weight_sync(inference_engine_cfg.speculative_config),
         }
 
-        if reset_prefix_cache and torch.distributed.get_rank() == 0 and not sender_handles_prefix_cache_reset:
+        if (
+            reset_prefix_cache
+            and torch.distributed.get_rank() == 0
+            and not sender_handles_prefix_cache_reset
+            and not getattr(self.weight_extractor, "defers_prefix_cache_reset", False)
+        ):
             # clear prefix cache
             cache_reset_task = inference_engine_client.reset_prefix_cache(reset_running_requests=True)
 
@@ -1939,6 +1974,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         if self._weight_transfer_sender.empty_cache_after_send or self.cfg.placement.colocate_all:
             torch.cuda.empty_cache()
         torch.distributed.barrier()
+
+        completion = getattr(self.weight_extractor, "completion_receipt", None)
+        if callable(completion):
+            return completion()
 
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method
@@ -2054,8 +2093,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.model: MegatronModelWrapper = None
-        self.actor_module: List[nn.Module] = None
+        self.model = None
+        self.actor_module = None
 
     def forward(self, data: TrainingInputBatch) -> WorkerOutput:
         """Run inference forward pass.
@@ -2106,7 +2145,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             pp_size=mpu.get_pipeline_model_parallel_world_size(),
         )
 
-    def init_model(self, model_path, num_training_steps: int = 1e9):
+    def init_model(self, model_path, num_training_steps: int = 1_000_000_000):
         """
         Initialize the model for the ref worker.
         """
@@ -2161,7 +2200,9 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         # create worker model
         # Propagate is_vlm so ref forwards apply the same VLM image handling and
         # parallelism guards as the policy worker.
-        self.model = MegatronModelWrapper(config=self.cfg, actor_module=self.actor_module, is_vlm=self.is_vlm)
+        self.model = cast(
+            Any, MegatronModelWrapper(config=self.cfg, actor_module=self.actor_module, is_vlm=self.is_vlm)
+        )
 
         self._set_expandable_segments(True)
 

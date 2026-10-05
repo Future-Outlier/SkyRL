@@ -7,7 +7,7 @@ reload once per weight sync rather than once per chunk.
 
 import inspect
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -96,7 +96,9 @@ class LayerwiseReloadWorkerMixin:
         if not getattr(self, "_weight_update_active", False):
             raise RuntimeError("start_weight_update must be called before loading weights.")
         if getattr(self, "_weight_update_is_draft", False):
-            engine = self.weight_transfer_engine
+            engine = getattr(self, "weight_transfer_engine", None)
+            if engine is None:
+                raise RuntimeError("An active draft update requires its native transfer engine.")
             return engine.model, engine.model_config
         return self.model_runner.model, self.model_config
 
@@ -144,7 +146,7 @@ class LayerwiseReloadWorkerMixin:
                 initialize_layerwise_reload,
             )
 
-            model = self.model_runner.model
+            model = self.model_runner.get_model()
             with set_current_vllm_config(self.vllm_config), torch.device(self.device):
                 initialize_layerwise_reload(model)
 
@@ -158,9 +160,11 @@ class LayerwiseReloadWorkerMixin:
         self._weight_update_active = True
         self._weight_update_is_draft = False
 
-    def skyrl_finish_weight_update(self) -> None:
+    def skyrl_finish_weight_update(self) -> dict[str, Any] | None:
         """
         Finalize the current weight update.
+
+        Extensions may return an applied-weight receipt; this default returns None.
 
         For checkpoint-format weights, runs layerwise postprocessing
         (quantization repacking, attention weight processing, etc.).

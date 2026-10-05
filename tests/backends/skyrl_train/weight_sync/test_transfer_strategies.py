@@ -1,4 +1,6 @@
 import asyncio
+from importlib import import_module
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import torch
@@ -21,8 +23,14 @@ from skyrl.backends.skyrl_train.weight_sync.base import WeightChunk
 from skyrl.backends.skyrl_train.weight_sync.broadcast_strategy import (
     BroadcastWeightTransferSender,
 )
+from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import IpcHandle
 from skyrl.train.config import InferenceEngineConfig
 from skyrl.train.config.config import DeltaWeightSyncConfig
+
+if TYPE_CHECKING:
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        RemoteInferenceClient,
+    )
 
 
 class TestGetTransferStrategyCls:
@@ -446,8 +454,8 @@ class TestExpertOwnership:
         }
         src._expert_name_source = "test stub"
         src._layer_geom = {}
-        src._phase = {}
-        src._phase_prefix = ""
+        setattr(src, "_phase", {})
+        setattr(src, "_phase_prefix", "")
         return src
 
     @staticmethod
@@ -578,8 +586,8 @@ class TestHeldNamesComposition:
         src._demoted = False
         src._expert_names = {}
         src._layer_geom = {}
-        src._phase = {}
-        src._phase_prefix = ""
+        setattr(src, "_phase", {})
+        setattr(src, "_phase_prefix", "")
         src._meta = [ParamMeta(n, torch.bfloat16, (2, 2)) for n in names]
         if owned is not None:
             src._owned_group_idx = owned
@@ -608,6 +616,7 @@ class TestHeldNamesComposition:
         held0 = self._source(2, 0, names).held_names()
         held1 = self._source(2, 1, names).held_names()
         assert held0 == [names[0]] and held1 == [names[1]]
+        assert held0 is not None and held1 is not None
         assert sorted(held0 + held1) == sorted(names)
 
     def test_neither_grain_holds_everything(self):
@@ -735,8 +744,8 @@ class TestShardedRdtVllmRegistration:
     def test_engine_registered(self):
         pytest.importorskip("vllm")
         # Importing the weight_sync package's register module runs ensure_registered().
-        from vllm.config import WeightTransferConfig
-        from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+        WeightTransferConfig = import_module("vllm.config").WeightTransferConfig
+        WeightTransferEngineFactory = import_module("vllm.distributed.weight_transfer").WeightTransferEngineFactory
 
         from skyrl.backends.skyrl_train.weight_sync.sharded_rdt import rdt_vllm_register
 
@@ -753,7 +762,7 @@ class TestShardedRdtVllmRegistration:
         it only when a worker constructs the backend, so a stale path fails on a real
         inference worker rather than here. Force the loader to resolve it."""
         pytest.importorskip("vllm")
-        from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+        WeightTransferEngineFactory = import_module("vllm.distributed.weight_transfer").WeightTransferEngineFactory
 
         from skyrl.backends.skyrl_train.weight_sync.sharded_rdt import rdt_vllm_register
         from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_engine import (
@@ -914,7 +923,7 @@ def test_broadcast_sender_preserves_mixed_dtype_logical_chunk(monkeypatch):
             override_existing_receiver=False,
         ),
         model_update_group=object(),
-        inference_client=client,
+        inference_client=cast("RemoteInferenceClient", client),
     )
     sent_chunks = []
 
@@ -981,7 +990,7 @@ def test_broadcast_send_chunk_uses_vendored_send_and_init_time_packed(monkeypatc
             override_existing_receiver=False,
         ),
         model_update_group=group,
-        inference_client=client,
+        inference_client=cast("RemoteInferenceClient", client),
     )
     sends = []
 
@@ -1022,19 +1031,19 @@ def test_broadcast_sender_retains_precomputed_metadata_path(monkeypatch):
             override_existing_receiver=False,
         ),
         model_update_group=object(),
-        inference_client=object(),
+        inference_client=cast("RemoteInferenceClient", object()),
     )
     calls = []
 
-    async def record_batched(chunks, weight_metadata, target="model"):
-        calls.append((list(chunks), weight_metadata))
+    async def record_batched(chunks, weight_metadata, target="model", is_checkpoint_format=True):
+        calls.append((list(chunks), weight_metadata, is_checkpoint_format))
 
     monkeypatch.setattr(sender, "_send_chunks_vllm_native", record_batched)
     metadata = {"names": ["w"], "dtype_names": ["bfloat16"], "shapes": [[1]]}
 
     asyncio.run(sender.send_chunks(iter([]), weight_metadata=metadata))
 
-    assert calls == [([], metadata)]
+    assert calls == [([], metadata, True)]
 
 
 class TestCudaIpcWeightUpdateRequest:
@@ -1042,12 +1051,14 @@ class TestCudaIpcWeightUpdateRequest:
 
     def test_serialize_roundtrip(self):
         """Serialization/deserialization roundtrip preserves data."""
+        # Picklable opaque CPU descriptor; this test never reconstructs CUDA IPC.
+        handle: IpcHandle = (torch.empty, (0,))
         request = CudaIpcWeightUpdateRequest(
             names=["model.layer.weight"],
             dtypes=["bfloat16"],
             shapes=[[4096, 4096]],
             sizes=[4096 * 4096],
-            ipc_handles={"gpu-uuid": "test_handle"},
+            ipc_handles={"gpu-uuid": handle},
         )
 
         data = request.serialize()
@@ -1061,12 +1072,13 @@ class TestCudaIpcWeightUpdateRequest:
 
     def test_serialize_roundtrip_multiple_weights(self):
         """Roundtrip with multiple weights."""
+        handle: IpcHandle = (torch.empty, (0,))
         request = CudaIpcWeightUpdateRequest(
             names=["layer1.weight", "layer2.weight", "layer3.bias"],
             dtypes=["bfloat16", "bfloat16", "bfloat16"],
             shapes=[[4096, 4096], [4096, 1024], [1024]],
             sizes=[4096 * 4096, 4096 * 1024, 1024],
-            ipc_handles={"gpu-0": "handle1"},
+            ipc_handles={"gpu-0": handle},
         )
 
         data = request.serialize()

@@ -107,6 +107,7 @@ class WeightTransferSender(ABC):
             weight_extractor.extract_weights(dtype),
             weight_metadata=(None if derive_metadata_from_chunks else weight_extractor.get_weight_metadata(dtype)),
             derive_metadata_from_chunks=derive_metadata_from_chunks,
+            is_checkpoint_format=getattr(weight_extractor, "is_checkpoint_format", True),
             target=target,
             **kwargs,
         )

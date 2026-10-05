@@ -8,6 +8,7 @@ import asyncio
 import os
 import socket
 from dataclasses import dataclass, replace
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
     )
     from skyrl.train.config.config import InferenceEngineConfig
 
-import ray
+import ray._private.services
 import torch
 
 from skyrl.backends.skyrl_train.weight_sync.base import (
@@ -141,6 +142,7 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         weight_metadata: Optional[Dict[str, list]] = None,
         derive_metadata_from_chunks: bool = False,
         target: str = WEIGHT_UPDATE_TARGET_MODEL,
+        is_checkpoint_format: bool = True,
         **kwargs,
     ) -> None:
         """Send chunks via broadcast or vLLM native NCCL.
@@ -154,15 +156,20 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         if derive_metadata_from_chunks:
             if weight_metadata is not None:
                 raise ValueError("weight_metadata must be omitted when deriving metadata from chunks")
-            await self._send_serialized_fp8_chunks_vllm_native(chunks, target=target)
+            await self._send_serialized_fp8_chunks_vllm_native(
+                chunks, target=target, is_checkpoint_format=is_checkpoint_format
+            )
         else:
-            await self._send_chunks_vllm_native(chunks, weight_metadata, target=target)
+            await self._send_chunks_vllm_native(
+                chunks, weight_metadata, target=target, is_checkpoint_format=is_checkpoint_format
+            )
 
     async def _send_chunks_vllm_native(
         self,
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]],
         target: str = WEIGHT_UPDATE_TARGET_MODEL,
+        is_checkpoint_format: bool = True,
     ) -> None:
         """Batched path: one update_weights call + nccl_trainer_send_weights.
 
@@ -185,7 +192,7 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         # patch lands (vllm-project/vllm weight-sync-fix).
         # https://github.com/vllm-project/vllm/pull/42577
         if torch.distributed.get_rank() == 0:
-            await self._inference_client.start_weight_update(is_checkpoint_format=True, target=target)
+            await self._inference_client.start_weight_update(is_checkpoint_format=is_checkpoint_format, target=target)
 
             # vLLM 0.28.0 dropped `packed` (and the buffer geometry) from
             # NCCLWeightTransferUpdateInfo -- it is agreed once at init instead,
@@ -212,10 +219,11 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         self,
         chunks: Iterable[WeightChunk],
         target: str = WEIGHT_UPDATE_TARGET_MODEL,
+        is_checkpoint_format: bool = True,
     ) -> None:
         """Send lazy mixed-dtype serialized-FP8 chunks through vLLM NCCL."""
         if torch.distributed.get_rank() == 0:
-            await self._inference_client.start_weight_update(is_checkpoint_format=True, target=target)
+            await self._inference_client.start_weight_update(is_checkpoint_format=is_checkpoint_format, target=target)
 
         for chunk in chunks:
             if torch.distributed.get_rank() == 0:
@@ -249,8 +257,11 @@ class BroadcastWeightTransferSender(WeightTransferSender):
 
     def _send_weights(self, weights: Iterator[Tuple[str, torch.Tensor]]) -> None:
         # Executor threads may differ between sends; CUDA device selection is thread-local.
-        with torch.cuda.device(self._model_update_group.device):
-            nccl_trainer_send_weights(weights, self._model_update_group, packed=self._init_info.packed)
+        group = self._model_update_group
+        if group is None:
+            raise RuntimeError("Broadcast sender has no initialized weight-transfer communicator")
+        with torch.cuda.device(group.device):
+            nccl_trainer_send_weights(weights, group, packed=self._init_info.packed)
 
     def teardown(self) -> None:
         """Destroy the process group used for weight transfer."""
@@ -275,10 +286,10 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
         """Check physical GPU ownership on all trainer ranks before either side joins NCCL."""
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         gpu_uuid = cuda_uuid_to_str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
-        trainer_uuids = [None] * torch.distributed.get_world_size()
+        trainer_uuids: List[str | None] = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(trainer_uuids, gpu_uuid)
 
-        error = [None]
+        error: List[str | None] = [None]
         if torch.distributed.get_rank() == 0:
             try:
                 inference_uuids = await inference_client.get_gpu_uuids()
@@ -287,7 +298,9 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
                     raise RuntimeError(
                         f"Expected {inference_world_size} inference GPU UUIDs, got {reported_world_size}"
                     )
-                participants = [(f"trainer rank {rank}", uuid) for rank, uuid in enumerate(trainer_uuids)]
+                participants: List[Tuple[str, str | None]] = [
+                    (f"trainer rank {rank}", uuid) for rank, uuid in enumerate(trainer_uuids)
+                ]
                 participants.extend(
                     (f"inference worker {rank} on {url}", uuid)
                     for url, uuids in inference_uuids.items()
@@ -312,7 +325,7 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
     @staticmethod
     def create_init_info(
         ie_cfg: "InferenceEngineConfig",
-        inference_world_size: int,
+        inference_world_size: Optional[int] = None,
         base_model_path: Optional[str] = None,
     ) -> BroadcastInitInfo:
         """Create init info with all config-derived args.
@@ -325,6 +338,8 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
             BroadcastInitInfo containing all args needed for sender/receiver creation.
         """
         # Use world_size reported by the inference servers (+1 for trainer rank 0).
+        if inference_world_size is None:
+            raise ValueError("Broadcast initialization requires the inference world size")
         world_size = inference_world_size + 1
 
         master_addr = ray._private.services.get_node_ip_address()
@@ -342,7 +357,7 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
 
     @staticmethod
     def create_sender(
-        init_info: BroadcastInitInfo,
+        init_info: WeightSyncInitInfo,
         inference_client: "RemoteInferenceClient",
         weight_extractor: Optional[Any] = None,
     ) -> BroadcastWeightTransferSender:
@@ -358,6 +373,8 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
                 ``prepare_broadcast()`` hook. Called on the assigned CUDA device
                 before communicator creation; exceptions abort initialization.
         """
+        if not isinstance(init_info, BroadcastInitInfo):
+            raise TypeError("Broadcast sender requires BroadcastInitInfo")
         rank = torch.distributed.get_rank()
         model_update_group = None
 
@@ -389,8 +406,4 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
         natively. Currently unused on the sender side (we route through the
         SkyRL ``/collective_rpc`` wrap), kept as the canonical mapping.
         """
-        from vllm.distributed.weight_transfer.nccl_engine import (
-            NCCLWeightTransferEngine,
-        )
-
-        return NCCLWeightTransferEngine
+        return import_module("vllm.distributed.weight_transfer.nccl_engine").NCCLWeightTransferEngine

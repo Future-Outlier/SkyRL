@@ -8,6 +8,7 @@ import base64
 import copy
 import pickle
 from dataclasses import asdict, dataclass
+from importlib import import_module
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -35,10 +36,10 @@ from skyrl.backends.skyrl_train.weight_sync.base import (
     iter_single_dtype_chunks,
     torch_dtype_name,
 )
-from skyrl.backends.skyrl_train.weight_sync.ipc_metadata import merge_ipc_metadata
 from skyrl.backends.skyrl_train.weight_sync.draft_weights import (
     WEIGHT_UPDATE_TARGET_MODEL,
 )
+from skyrl.backends.skyrl_train.weight_sync.ipc_metadata import merge_ipc_metadata
 from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
     WeightSyncInitInfo,
     WeightTransferSender,
@@ -159,6 +160,7 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         weight_metadata: Optional[Dict[str, list]] = None,
         derive_metadata_from_chunks: bool = False,
         target: str = WEIGHT_UPDATE_TARGET_MODEL,
+        is_checkpoint_format: bool = True,
         **kwargs,
     ) -> None:
         """Send chunks via CUDA IPC.
@@ -169,13 +171,16 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
             derive_metadata_from_chunks: Accepted for sender interface compatibility.
             target: The vLLM model this session loads into (``"model"`` / ``"draft"``).
         """
-        await self._send_chunks_vllm_native(chunks, weight_metadata, target=target)
+        await self._send_chunks_vllm_native(
+            chunks, weight_metadata, target=target, is_checkpoint_format=is_checkpoint_format
+        )
 
     async def _send_chunks_vllm_native(
         self,
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]] = None,
         target: str = WEIGHT_UPDATE_TARGET_MODEL,
+        is_checkpoint_format: bool = True,
     ) -> None:
         """Send weights chunk-by-chunk via vLLM native IPC (new inference path).
 
@@ -200,7 +205,7 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         device = torch.cuda.current_device()
         gpu_uuid = cuda_uuid_to_str(torch.cuda.get_device_properties(device).uuid)
         if rank == 0:
-            await self._inference_client.start_weight_update(is_checkpoint_format=True, target=target)
+            await self._inference_client.start_weight_update(is_checkpoint_format=is_checkpoint_format, target=target)
         torch.distributed.barrier()
 
         for logical_chunk in chunks:
@@ -310,7 +315,7 @@ class CudaIpcTransferStrategy(WeightTransferStrategy):
 
     @staticmethod
     def create_sender(
-        init_info: CudaIpcInitInfo,
+        init_info: WeightSyncInitInfo,
         inference_client: "RemoteInferenceClient",
         weight_extractor: Optional[Any] = None,
     ) -> CudaIpcWeightTransferSender:
@@ -323,6 +328,8 @@ class CudaIpcTransferStrategy(WeightTransferStrategy):
         Returns:
             A configured CudaIpcWeightTransferSender instance.
         """
+        if not isinstance(init_info, CudaIpcInitInfo):
+            raise TypeError("CUDA IPC sender requires CudaIpcInitInfo")
         return CudaIpcWeightTransferSender(
             init_info=init_info,
             inference_client=inference_client,
@@ -336,6 +343,4 @@ class CudaIpcTransferStrategy(WeightTransferStrategy):
         natively. Currently unused on the sender side (we route through the
         SkyRL ``/collective_rpc`` wrap), kept as the canonical mapping.
         """
-        from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine
-
-        return IPCWeightTransferEngine
+        return import_module("vllm.distributed.weight_transfer.ipc_engine").IPCWeightTransferEngine

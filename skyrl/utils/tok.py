@@ -4,11 +4,12 @@ from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+    PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
 
 
-def get_tokenizer(model_name_or_path, **tokenizer_kwargs) -> AutoTokenizer:
+def get_tokenizer(model_name_or_path, **tokenizer_kwargs) -> PreTrainedTokenizerBase:
     """Gets tokenizer for the given base model with the given parameters
 
     Sets the pad token ID to EOS token ID if `None`"""

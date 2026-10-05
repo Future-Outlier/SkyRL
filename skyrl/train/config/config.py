@@ -33,9 +33,11 @@ class BaseConfig(ABC):
     """
 
     @classmethod
-    def from_dict_config(cls, cfg: DictConfig) -> "BaseConfig":
+    def from_dict_config(cls, cfg: DictConfig) -> typing.Self:
         """Construct a typed BaseConfig from a Hydra DictConfig."""
         raw = OmegaConf.to_container(cfg, resolve=True)
+        if not isinstance(raw, dict):
+            raise TypeError("Configuration must resolve to a mapping")
         return build_nested_dataclass(cls, raw)
 
 
@@ -1438,6 +1440,12 @@ class TrainerConfig(BaseConfig):
     enable_isoexec: bool = False
     """Build trainer and rollout models through the installed IsoExec package.
     IsoExec remains opt-in and must be installed in every driver, trainer, and inference-worker environment."""
+    isoexec_model: Optional[Dict[str, Any]] = None
+    """Optional JSON V2 source/configuration and separate trainer/inference placement policy.
+    Native Megatron and inference-engine parallelism fields remain authoritative."""
+    isoexec_capture_max_tokens: Optional[int] = None
+    """Optional bound on padded packed V2 trainer/prescore tokens. Standard batched rollouts derive it;
+    custom trajectories must provide a finite bound. Actual inputs are still guarded by the captured profile."""
     rollout_logprob_comparison: Literal["action", "full"] = "action"
     """Rollout-versus-trainer logprob comparison mode.
     ``"action"`` preserves the sampled-token diagnostic. ``"full"`` requires matching
@@ -1803,6 +1811,8 @@ def build_nested_dataclass(datacls: Type[T], d: dict) -> T:
     Returns:
         An instance of the dataclass.
     """
+    if not dataclasses.is_dataclass(datacls):
+        raise TypeError("Configuration class must be a dataclass")
     validate_dict_keys_against_dataclass(datacls, d)
     kwargs = {}
     for f in dataclasses.fields(datacls):
@@ -2074,4 +2084,7 @@ def get_config_as_dict(cfg: Union[dict, BaseConfig]) -> dict:
 
 
 def get_config_as_yaml_str(cfg: BaseConfig) -> str:
-    return yaml.dump(asdict(cfg))
+    value = yaml.dump(asdict(cfg))
+    if not isinstance(value, str):
+        raise TypeError("Configuration YAML must be returned as text")
+    return value
