@@ -857,18 +857,21 @@ def build_dataloader(
     seeded_generator = torch.Generator()
     seeded_generator.manual_seed(cfg.trainer.seed)
 
-    num_workers = cfg.data.dataloader.num_workers
-    assert num_workers is not None, "dataloader `num_workers` should be non-null"
+    configured_num_workers = cfg.data.dataloader.num_workers
+    assert configured_num_workers is not None, "dataloader `num_workers` should be non-null"
+
+    num_workers = configured_num_workers if is_train else 0
+    persistent_workers = cfg.data.dataloader.persistent_workers if is_train else False
 
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=batch_size if not is_fully_async else 1,
+        batch_size=1 if is_train and is_fully_async else batch_size,
         shuffle=True if is_train else False,
         collate_fn=dataset.collate_fn,
         num_workers=num_workers,
-        # Unlike `shuffle`/`drop_last`, not branched on `is_train`: both dataloaders are
-        # reused (train across epochs, eval across evaluations) to avoid worker respawn
-        persistent_workers=cfg.data.dataloader.persistent_workers,
+        # Evaluation runs in the driver process, so only training can keep worker
+        # processes alive across epochs.
+        persistent_workers=persistent_workers,
         drop_last=True if is_train else False,
         generator=seeded_generator,
         # NOTE (sumanthrh): We use ray and thus use `spawn` start method.

@@ -47,8 +47,9 @@ class DataLoaderConfig(BaseConfig):
         default=None,
         metadata={
             "help": (
-                "Prompt DataLoader worker processes. Default of None auto-derives to 8. "
-                "Set 0 for in-process loading that never respawns workers at epoch boundaries."
+                "Training Prompt DataLoader worker processes. Default of None auto-derives to 8. "
+                "Set 0 for in-process training data loading. Evaluation data loading always runs "
+                "in the driver process."
             )
         },
     )
@@ -56,8 +57,9 @@ class DataLoaderConfig(BaseConfig):
         default=False,
         metadata={
             "help": (
-                "Keep DataLoader workers alive across epochs instead of respawning them at "
-                "every epoch boundary. Setting this requires `num_workers > 0`"
+                "Keep training DataLoader workers alive across epochs instead of respawning them at "
+                "every epoch boundary. Setting this requires `num_workers > 0`; evaluation always "
+                "uses `persistent_workers=False`."
             )
         },
     )

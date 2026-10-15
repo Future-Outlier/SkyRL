@@ -7,7 +7,7 @@ import json
 import os
 import re
 import tempfile
-from typing import Union
+from typing import Union, cast
 from unittest.mock import Mock, mock_open, patch
 
 import numpy as np
@@ -15,6 +15,7 @@ import pytest
 import ray
 
 from skyrl.train.config import SkyRLTrainConfig
+from skyrl.train.dataset import PromptDataset
 from skyrl.train.generators.base import GeneratorInput, GeneratorOutput, TrajectoryID
 from skyrl.train.utils.trainer_utils import (
     build_dataloader,
@@ -1006,6 +1007,13 @@ def test_build_dataloader_seeding(dummy_config):
     [
         pytest.param(["data.dataloader.num_workers=0"], 0, False, None, id="workerless"),
         pytest.param(
+            ["data.dataloader.num_workers=8", "data.dataloader.persistent_workers=false"],
+            8,
+            False,
+            "spawn",
+            id="nonpersistent-spawn-workers",
+        ),
+        pytest.param(
             ["data.dataloader.num_workers=2", "data.dataloader.persistent_workers=true"],
             2,
             True,
@@ -1020,7 +1028,7 @@ def test_build_dataloader_worker_config(
     expected_persistent: bool,
     expected_start_method: str | None,
 ) -> None:
-    """build_dataloader passes num_workers/persistent_workers through and derives the spawn context."""
+    """The training dataloader preserves worker settings and derives the spawn context."""
     config = SkyRLTrainConfig.from_cli_overrides(["trainer.train_batch_size=2", *overrides])
     dataloader = build_dataloader(config, MultiItemDataset(size=8), is_train=True)
     assert dataloader.num_workers == expected_num_workers
@@ -1029,6 +1037,43 @@ def test_build_dataloader_worker_config(
         None if dataloader.multiprocessing_context is None else dataloader.multiprocessing_context.get_start_method()
     )
     assert start_method == expected_start_method
+
+
+def test_build_eval_dataloader_runs_in_driver_process_without_mutating_config() -> None:
+    """The evaluation dataloader ignores training worker settings."""
+    config = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.eval_batch_size=8",
+            "data.dataloader.num_workers=8",
+            "data.dataloader.persistent_workers=true",
+        ]
+    )
+
+    dataset = cast(PromptDataset, cast(object, MultiItemDataset(size=32)))
+    dataloader = build_dataloader(config, dataset, is_train=False)
+
+    assert dataloader.num_workers == 0
+    assert dataloader.persistent_workers is False
+    assert dataloader.multiprocessing_context is None
+    assert dataloader.batch_size == 8
+    assert config.data.dataloader.num_workers == 8
+    assert config.data.dataloader.persistent_workers is True
+
+
+def test_build_eval_dataloader_preserves_data_across_iterations() -> None:
+    """Repeated evaluation preserves every sample's content and order."""
+    config = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.eval_batch_size=8",
+            "data.dataloader.num_workers=8",
+        ]
+    )
+    expected_batches = [[f"item_{i}" for i in range(start, start + 8)] for start in range(0, 32, 8)]
+    dataset = cast(PromptDataset, cast(object, MultiItemDataset(size=32)))
+    dataloader = build_dataloader(config, dataset, is_train=False)
+
+    assert list(dataloader) == expected_batches
+    assert list(dataloader) == expected_batches
 
 
 def test_validate_generator_output_invalid_rewards():
