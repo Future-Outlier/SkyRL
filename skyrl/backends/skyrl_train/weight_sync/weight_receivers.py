@@ -253,11 +253,23 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
     base class they mix into, and every step here is the same for both.
     """
 
+    def _model_has_weight_update_methods(self) -> bool:
+        return callable(getattr(self.model, "start_weight_update", None)) and callable(
+            getattr(self.model, "finish_weight_update", None)
+        )
+
+    def _finish_without_layerwise_reload(self) -> None:
+        self.model.finish_weight_update()
+
     def start_weight_update(self) -> None:
         if self.skyrl_lora_armed():
             # No layerwise reload: an adapter update never writes to the base
             # model's parameters, so there is nothing to reload.
             self.skyrl_begin_lora_update()
+            return
+        if self._model_has_weight_update_methods():
+            with torch.device(self.device):
+                self.model.start_weight_update()
             return
         skyrl_before_weight_update()
         with torch.device(self.device):
@@ -276,6 +288,11 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             # No layerwise finalize: an adapter update never writes to the base
             # model's parameters.
             self.skyrl_finish_lora_update()
+            return
+        if self._model_has_weight_update_methods():
+            with torch.device(self.device):
+                self._finish_without_layerwise_reload()
+            empty_cuda_cache_rocm()
             return
         with torch.device(self.device):
             super().finish_weight_update()
@@ -297,6 +314,10 @@ def _build_skyrl_ipc_engine() -> type:
 
     class SkyrlIPCWeightTransferEngine(SkyrlReceiveLifecycleMixin, IPCWeightTransferEngine):
         """vLLM's CUDA IPC receive engine plus SkyRL receive targets."""
+
+        def _finish_without_layerwise_reload(self) -> None:
+            super()._finish_without_layerwise_reload()
+            self._packed_importer.close()
 
     return SkyrlIPCWeightTransferEngine
 

@@ -267,3 +267,24 @@ def test_native_ipc_trainer_preserves_serialized_fp8_mixed_stream(monkeypatch):
     ]
     assert observed["buffer_size_bytes"] == 1024
     assert client.update_infos[0]["tensor_sizes"] == [tensor.nbytes for _, tensor in observed["stream"]]
+
+
+def test_native_ipc_model_finish_closes_the_packed_importer():
+    from skyrl.backends.skyrl_train.weight_sync.weight_receivers import get_skyrl_ipc_engine
+
+    events = []
+    model = SimpleNamespace(
+        start_weight_update=lambda: events.append("start"),
+        finish_weight_update=lambda: events.append("finish"),
+    )
+    importer = SimpleNamespace(close=lambda: events.append("close"))
+    engine_cls = get_skyrl_ipc_engine()
+    engine = engine_cls.__new__(engine_cls)
+    engine.device = torch.device("cpu")
+    engine.model = model
+    engine._packed_importer = importer
+
+    engine.start_weight_update()
+    engine.finish_weight_update()
+
+    assert events == ["start", "finish", "close"]

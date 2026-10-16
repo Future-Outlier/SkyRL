@@ -64,6 +64,22 @@ class _FakeModel:
         return iter(())
 
 
+class _ModelWithWeightUpdate(_FakeModel):
+    def __init__(self, loaded: list) -> None:
+        super().__init__(loaded)
+        self.calls = []
+
+    def start_weight_update(self) -> None:
+        self.calls.append("start")
+
+    def load_weights(self, weights=None, **kwargs):
+        self.calls.append("load")
+        return super().load_weights(weights, **kwargs)
+
+    def finish_weight_update(self) -> None:
+        self.calls.append("finish")
+
+
 class _Engine(SkyrlReceiveLifecycleMixin, _FakeVllmEngine):
     def __init__(self, weights, lora_enabled=True):
         super().__init__(weights)
@@ -178,6 +194,20 @@ class TestUnarmedRound:
         ((name, tensor),) = engine.loaded[0]
         assert name == "w" and torch.equal(tensor, torch.ones(2))
         assert patch.staged_adapter_names() == []
+
+    def test_model_weight_update_methods_replace_layerwise_reload(self, monkeypatch):
+        engine = _Engine([("w", torch.ones(2))])
+        model = _ModelWithWeightUpdate(engine.loaded)
+        engine.model = model
+        monkeypatch.setattr(weight_receivers, "skyrl_before_weight_update", lambda: engine.calls.append("before"))
+        monkeypatch.setattr(weight_receivers, "skyrl_after_weight_update", lambda: engine.calls.append("after"))
+
+        _run_round(engine)
+
+        assert engine.calls == ["receive"]
+        assert model.calls == ["start", "load", "finish"]
+        ((name, tensor),) = engine.loaded[0]
+        assert name == "w" and torch.equal(tensor, torch.ones(2))
 
 
 class TestStagingRegistry:
