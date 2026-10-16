@@ -165,6 +165,15 @@ def resolve_policy_model_name(cfg: SkyRLTrainConfig) -> str:
     return cfg.generator.inference_engine.served_model_name or cfg.trainer.policy.model.path
 
 
+def _apply_isoexec_engine_args(cfg: SkyRLTrainConfig, args: Namespace) -> None:
+    """Let the opt-in integration update SkyRL's already-resolved vLLM arguments."""
+    if not cfg.trainer.enable_isoexec:
+        return
+    from isoexec.integrations.skyrl.config import engine_args
+
+    engine_args(cfg, args)
+
+
 # TODO: Add a test for validation
 def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     """Build CLI args for vLLM server from config."""
@@ -300,6 +309,8 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     )
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
+
+    _apply_isoexec_engine_args(cfg, args)
 
     return args
 
