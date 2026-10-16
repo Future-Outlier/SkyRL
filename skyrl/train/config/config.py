@@ -1484,6 +1484,8 @@ class TrainerConfig(BaseConfig):
     ``"fsdp"`` uses PyTorch's composable ``fully_shard`` API (formerly known as FSDP2)."""
     enable_isoexec: bool = False
     """Build trainer and rollout models through the installed IsoExec package."""
+    isoexec_model: Optional[Dict[str, Any]] = None
+    """V2 ModelSource plus optional revision, raw config, and placement mappings."""
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     ref: RefConfig = field(default_factory=RefConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
