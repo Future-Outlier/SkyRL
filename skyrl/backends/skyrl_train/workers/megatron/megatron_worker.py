@@ -850,6 +850,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             seed=self.cfg.seed,
             is_lora=self._is_lora,
             node_local_rank=self._local_rank,
+            enable_isoexec=self.cfg.enable_isoexec,
         )
         self.strategy.setup_distributed()
 
@@ -867,6 +868,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import init_model
+
+            return init_model(self, model_path, num_training_steps, section="policy")
+
         # Fake-INT4 QAT: install the MoE expert fake-quant hook and (when the
         # served checkpoint is INT4) redirect the trainer's BF16 master weights.
         bridge_weights_path = self._maybe_setup_fake_int4_qat()
@@ -1326,7 +1332,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # spans more than one call.
         self.model.run_pending_grad_sync()
 
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import optimizer_step
+
+            grad_norm = optimizer_step(self)
+        else:
+            grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         # Clear the DDP grad buffers for the next window. `optimizer.zero_grad()` inside
         # `optimizer_step` only drops `param.grad` / the fp32 main-param grads -- the
@@ -1906,6 +1917,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             optimizer_config=None,
             seed=self.cfg.seed,
             node_local_rank=self._local_rank,
+            enable_isoexec=self.cfg.enable_isoexec,
         )
         self.strategy.setup_distributed()
 
@@ -1923,6 +1935,11 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         """
         Initialize the model for the ref worker.
         """
+        if self.cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.megatron import init_model
+
+            return init_model(self, model_path, num_training_steps, section="ref")
+
         # Fake-INT4 QAT: the ref shares the policy's base model. Mirror the
         # BF16-master redirect so it can load an INT4-served checkpoint, and the
         # (global) fake-quant hook keeps the KL anchor in the same weight space.

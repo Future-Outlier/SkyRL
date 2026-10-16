@@ -233,16 +233,30 @@ class MegatronModelWrapper:
         # use the built-in finalize_model_grads function to all reduce gradients across
         # parallelism dimensions -- but deferred to optim_step rather than run per
         # forward_backward. See `_defer_finalize_model_grads`.
+        # IsoExec model construction instead installs a callback that also synchronizes
+        # cross-PP tied parameters. Save the selected callback before replacing it with
+        # SkyRL's deferrer.
+        isoexec_enabled = getattr(self.cfg, "enable_isoexec", False) is True
+        self._finalize_model_grads = (
+            config.finalize_model_grads_func
+            if isoexec_enabled and config.finalize_model_grads_func is not None
+            else finalize_model_grads_with_expert_adapter_sync
+        )
         config.finalize_model_grads_func = self._defer_finalize_model_grads
         # Shared expert LoRA weights are replicated across EP; `run_pending_grad_sync`
         # sums their grads over EP once per step, so drop Bridge's per-microbatch
         # fallback hooks (which also miss grads under gradient_accumulation_fusion).
-        enable_expert_parallel_grad_sync_in_finalize(self.actor_module)
+        if not isoexec_enabled:
+            enable_expert_parallel_grad_sync_in_finalize(self.actor_module)
         # Wire up the optimizer's loss scaler so Megatron's pipeline schedule can scale
         # the loss before backward (critical for fp16 dynamic loss scaling, MoE aux loss
         # scaling, and any explicit loss_scale configuration).
         if actor_optimizer is not None:
             config.grad_scale_func = actor_optimizer.scale_loss
+        if isoexec_enabled:
+            from isoexec.integrations.skyrl.scoring import bind as bind_isoexec_scoring
+
+            bind_isoexec_scoring(self, config)
 
     def _defer_finalize_model_grads(self, model, num_tokens=None, **kwargs) -> None:
         """Record Megatron's end-of-schedule grad sync instead of running it.
@@ -278,7 +292,7 @@ class MegatronModelWrapper:
         """
         pending = self._pending_grad_sync
         self._pending_grad_sync = None
-        finalize_model_grads_with_expert_adapter_sync(self.actor_module, pending["num_tokens"] if pending else None)
+        self._finalize_model_grads(self.actor_module, pending["num_tokens"] if pending else None)
 
     def train(self):
         [module.train() for module in self.actor_module]
