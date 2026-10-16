@@ -1420,7 +1420,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         await super().init_weight_sync_state(inference_engine_client, inference_engine_cfg)
 
     def _build_weight_source(self, dtype: "torch.dtype", backend: str):
-        """``WeightSource`` over the Megatron policy model, via Megatron-Bridge."""
+        """Build this rank's ``WeightSource`` for the selected trainer backend."""
+        if self.cfg.enable_isoexec:
+            if backend not in {"nccl", "ipc"}:
+                raise ValueError(f"trainer.enable_isoexec supports nccl or ipc weight sync, got {backend!r}")
+            from isoexec.integrations.skyrl.weight_source import IsoExecWeightSource
+
+            return IsoExecWeightSource(self.actor_module, dtype)
+
         if self._lora_sync_mode_is_memory():
             # With merge_lora=false every sync is adapter-only (see
             # broadcast_to_inference_engines), so the engine's source IS the
