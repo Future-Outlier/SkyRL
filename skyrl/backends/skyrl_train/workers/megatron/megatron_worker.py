@@ -624,23 +624,28 @@ class MegatronWorker:
             if micro.get("image_grid_thw") is not None:
                 vlm_inputs["image_grid_thw"] = micro.get("image_grid_thw")
 
-            micro_dicts.append(
-                {
-                    "sequences": micro["sequences"],
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                    "num_actions": micro.metadata["response_length"],
-                    "rollout_expert_indices": (rollout_expert_indices if self.enable_router_replay else None),
-                    "router_padding_mask": micro.get("router_padding_mask") if self.enable_router_replay else None,
-                    SAMPLE_SUPPORT_FIELD: (
-                        micro.get(SAMPLE_SUPPORT_FIELD) if self.enable_sample_support_replay else None
-                    ),
-                    # The support scorer validates loss-active targets against captured support.
-                    "loss_mask": micro.get("loss_mask") if self.enable_sample_support_replay else None,
-                    "sub_seq_lengths": micro.get("sub_seq_lengths"),
-                    **vlm_inputs,
-                }
-            )
+            micro_dict = {
+                "sequences": micro["sequences"],
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "num_actions": micro.metadata["response_length"],
+                "rollout_expert_indices": (rollout_expert_indices if self.enable_router_replay else None),
+                "router_padding_mask": micro.get("router_padding_mask") if self.enable_router_replay else None,
+                SAMPLE_SUPPORT_FIELD: micro.get(SAMPLE_SUPPORT_FIELD) if self.enable_sample_support_replay else None,
+                # The support scorer validates loss-active targets against captured support.
+                "loss_mask": micro.get("loss_mask") if self.enable_sample_support_replay else None,
+                "sub_seq_lengths": micro.get("sub_seq_lengths"),
+                **vlm_inputs,
+            }
+            if micro.get("rollout_full_logprobs") is not None:
+                micro_dict.update(
+                    rollout_full_logprobs=micro["rollout_full_logprobs"],
+                    full_logprob_mask=micro["loss_mask"],
+                    rollout_logprobs=micro["rollout_logprobs"],
+                    sample_indices=micro.get("sample_indices"),
+                    global_step=(micro.metadata or {}).get("global_step"),
+                )
+            micro_dicts.append(micro_dict)
 
         if use_token_batching:
             # Pad microbatches to uniform batch size for Megatron compatibility

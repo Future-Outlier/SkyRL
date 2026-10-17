@@ -417,6 +417,7 @@ def validate_cfg(cfg: SkyRLTrainConfig):
 
     # Validate generation config separately
     validate_generator_cfg(cfg)
+    validate_logprob_comparison(cfg)
 
     # Multi-Token Prediction (MTP): the high-level `trainer.mtp` knob is the single source of truth.
     # Propagate it to the training side (Megatron MTP heads + decoupled draft loss) and the inference
@@ -620,6 +621,21 @@ def validate_cfg(cfg: SkyRLTrainConfig):
                 f"ref_num_gpus_per_node ({cfg.trainer.placement.ref_num_gpus_per_node}) must be the same "
                 f"when colocate policy and ref model."
             )
+
+
+def validate_logprob_comparison(cfg: SkyRLTrainConfig) -> None:
+    trainer = cfg.trainer
+    engine = cfg.generator.inference_engine
+    if engine.logprob_output != trainer.rollout_logprob_comparison:
+        raise ValueError("trainer.rollout_logprob_comparison and generator.inference_engine.logprob_output must match")
+    if trainer.rollout_logprob_comparison == "full":
+        if not trainer.enable_isoexec:
+            raise ValueError("full logprob comparison requires trainer.enable_isoexec=true")
+        from isoexec.integrations.skyrl.full_distribution_config import (
+            validate_full_distribution_config,
+        )
+
+        validate_full_distribution_config(cfg)
 
 
 def validate_generator_cfg(cfg: SkyRLTrainConfig):

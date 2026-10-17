@@ -123,11 +123,19 @@ def _apply_serialized_fp8_weight_sync_defaults(
     engine_kwargs["hf_overrides"] = hf_overrides
 
 
-def _validate_logprobs_mode(engine_kwargs: Dict[str, Any], *, context: str) -> None:
-    """Raises if *engine_kwargs* sets ``logprobs_mode`` to anything but ``VLLM_LOGPROBS_MODE``."""
-    logprobs_mode = engine_kwargs.get("logprobs_mode", VLLM_LOGPROBS_MODE)
-    if logprobs_mode != VLLM_LOGPROBS_MODE:
-        raise ValueError(f"{context}.logprobs_mode must be {VLLM_LOGPROBS_MODE!r}, got {logprobs_mode!r}.")
+def _validate_logprobs_mode(engine_kwargs: Dict[str, Any], *, context: str, expected: str = VLLM_LOGPROBS_MODE) -> None:
+    """Reject a role-specific mode that differs from the resolved engine mode."""
+    logprobs_mode = engine_kwargs.get("logprobs_mode", expected)
+    if logprobs_mode != expected:
+        raise ValueError(f"{context}.logprobs_mode must be {expected!r}, got {logprobs_mode!r}.")
+
+
+def _apply_full_logprob_engine_defaults(engine_kwargs: Dict[str, Any]) -> None:
+    """Request complete raw rows; IsoExec validates and compares their float32 bytes."""
+    for key, value in {"max_logprobs": -1, "logprobs_mode": "raw_logprobs"}.items():
+        if key in engine_kwargs and engine_kwargs[key] != value:
+            raise ValueError(f"engine_init_kwargs.{key} must be {value!r} for full logprobs")
+        engine_kwargs[key] = value
 
 
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
@@ -205,6 +213,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     args: Namespace = parser.parse_args(args=[])
 
     ie_cfg = cfg.generator.inference_engine
+    logprobs_mode = "raw_logprobs" if cfg.trainer.enable_isoexec else VLLM_LOGPROBS_MODE
     overrides = dict(
         model=cfg.trainer.policy.model.path,
         tensor_parallel_size=ie_cfg.tensor_parallel_size,
@@ -240,9 +249,9 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         # models with custom modeling code (MiMo, Qwen3.5, DeepSeek-V3, ...) require it to load.
         # Overridable via generator.inference_engine.engine_init_kwargs.trust_remote_code below.
         trust_remote_code=True,
-        # Logprobs are computed from the sampling distribution (after temperature and top-k/top-p).
-        # Other values from engine kwargs are rejected by _validate_logprobs_mode.
-        logprobs_mode=VLLM_LOGPROBS_MODE,
+        # Normal SkyRL uses the sampling distribution. IsoExec compares the raw
+        # model distribution and applies temperature through its own implementation.
+        logprobs_mode=logprobs_mode,
     )
     # Sample-support capture asks for one logprob per top-k candidate, post-filter, so the
     # -inf entries that mark filtered candidates survive to the capture path.
@@ -301,7 +310,13 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         logger.info(f"vLLM speculative decoding enabled: speculative_config={spec_cfg}")
 
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
-    _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
+    if ie_cfg.logprob_output == "full":
+        _apply_full_logprob_engine_defaults(engine_kwargs)
+    _validate_logprobs_mode(
+        engine_kwargs,
+        context="generator.inference_engine.engine_init_kwargs",
+        expected=logprobs_mode,
+    )
     _apply_serialized_fp8_weight_sync_defaults(
         ie_cfg,
         engine_kwargs,
@@ -376,7 +391,11 @@ def get_pd_cli_args(
     args = copy.deepcopy(cli_args)
 
     if role_init_kwargs:
-        _validate_logprobs_mode(role_init_kwargs, context=f"generator.inference_engine.{role}_init_kwargs")
+        _validate_logprobs_mode(
+            role_init_kwargs,
+            context=f"generator.inference_engine.{role}_init_kwargs",
+            expected=getattr(args, "logprobs_mode", VLLM_LOGPROBS_MODE),
+        )
         for key, value in role_init_kwargs.items():
             setattr(args, key, value)
 

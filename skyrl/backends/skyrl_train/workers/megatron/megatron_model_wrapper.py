@@ -224,6 +224,9 @@ class MegatronModelWrapper:
         # [B, S, vocab//TP] logits + its fp32 grad). See model_utils.
         self._fused_lm_head = bool(getattr(self.cfg, "fused_lm_head_logprob", False))
         self._fused_lm_head_backend = getattr(self.cfg, "fused_lm_head_logprob_backend", "torch")
+        self._packed_logprobs = None
+        self._scale_logits = None
+        self._forward_kwargs: dict[str, Any] = {}
         # Pending grad-sync request recorded by `_defer_finalize_model_grads`, replayed
         # by `run_pending_grad_sync`. See those methods for why the sync is deferred.
         self._pending_grad_sync: Optional[dict] = None
@@ -353,6 +356,7 @@ class MegatronModelWrapper:
 
         def collection_func(logits, *, data, metadata_layout: Optional[TokenMetadataLayout]):
             sequences = data["sequences"]
+            expected = data.get("rollout_full_logprobs")
             packed_seq_params = data.get("packed_seq_params")
             packed_targets = data.get("packed_targets")
             tp_grp = mpu.get_tensor_model_parallel_group()
@@ -363,13 +367,17 @@ class MegatronModelWrapper:
             # the chunked log-prob so this forward-only pass never materializes the
             # full [B, S, vocab//TP] logits (which would OOM at long context).
             fused_lm_head = self._fused_lm_head and data.get("lm_head_weight") is not None
+            if expected is not None and not getattr(self.cfg, "enable_isoexec", False):
+                raise ValueError("Full logprob comparison requires trainer.enable_isoexec=true")
             lm_head_weight = data.get("lm_head_weight")
             if fused_lm_head:
                 _v_local = int(lm_head_weight.shape[0])
                 fused_vocab_start, fused_vocab_end = tp_rank * _v_local, (tp_rank + 1) * _v_local
 
             # temperature normalization (the fused path applies it inside the op)
-            if temperature != 1.0 and not fused_lm_head:
+            if self._scale_logits is not None and not fused_lm_head:
+                logits = self._scale_logits(logits, temperature)
+            elif temperature != 1.0 and not fused_lm_head:
                 logits.div_(temperature)
 
             shard_vocab_size = lm_head_weight.shape[0] if fused_lm_head else logits.shape[-1]
@@ -424,7 +432,8 @@ class MegatronModelWrapper:
                     fused_backend=self._fused_lm_head_backend,
                 )
             elif packed_seq_params is not None and packed_targets is not None:
-                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+                packed_logprobs = self._packed_logprobs or from_parallel_logits_to_logprobs_packed_sequences
+                token_logprobs = packed_logprobs(
                     logits,
                     packed_targets,
                     packed_seq_params.cu_seqlens_q_padded,
@@ -449,6 +458,10 @@ class MegatronModelWrapper:
                     cp_group=None,
                     chunk_size=self.cfg.logprobs_chunk_size,  # chunk seq dim to bound peak memory
                 )
+            if expected is not None:
+                from isoexec.integrations.skyrl.scoring import verify_full_distribution
+
+                verify_full_distribution(self, logits, data, packed_seq_params)
             return torch.tensor(0.0, device=token_logprobs.device), {"log_probs": token_logprobs}
 
         def forward_step(batch_iter, model):
@@ -547,6 +560,7 @@ class MegatronModelWrapper:
                         packed_seq_params=packed_seq_params,
                         output_processor=fused_lm_head_output_processor,
                         output_processor_context=_op_ctx,
+                        **self._forward_kwargs,
                         **model_replay_kwargs,
                         **vlm_inputs,
                     )
@@ -557,6 +571,7 @@ class MegatronModelWrapper:
                         new_position_ids,
                         to_te_attention_mask(new_attention_mask),
                         packed_seq_params=packed_seq_params,
+                        **self._forward_kwargs,
                         **model_replay_kwargs,
                         **vlm_inputs,
                     )
@@ -710,7 +725,10 @@ class MegatronModelWrapper:
 
             # temperature normalization (the fused path applies it inside the op)
             if temperature != 1.0 and not fused_lm_head:
-                logits.div_(temperature)
+                if self._scale_logits is not None:
+                    logits = self._scale_logits(logits, temperature)
+                else:
+                    logits.div_(temperature)
 
             shard_vocab_size = lm_head_weight.shape[0] if fused_lm_head else logits.shape[-1]
             support_entropy = None
@@ -768,7 +786,8 @@ class MegatronModelWrapper:
                     fused_backend=self._fused_lm_head_backend,
                 )
             elif packed_seq_params is not None and packed_targets is not None:
-                token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+                packed_logprobs = self._packed_logprobs or from_parallel_logits_to_logprobs_packed_sequences
+                token_logprobs = packed_logprobs(
                     logits,
                     packed_targets,
                     packed_seq_params.cu_seqlens_q_padded,
@@ -1239,6 +1258,7 @@ class MegatronModelWrapper:
                         packed_seq_params=packed_seq_params,
                         output_processor=fused_lm_head_output_processor,
                         output_processor_context=_op_ctx,
+                        **self._forward_kwargs,
                         **model_replay_kwargs,
                         **vlm_inputs,
                     )
@@ -1249,6 +1269,7 @@ class MegatronModelWrapper:
                         new_position_ids,
                         to_te_attention_mask(new_attention_mask),
                         packed_seq_params=packed_seq_params,
+                        **self._forward_kwargs,
                         **model_replay_kwargs,
                         **vlm_inputs,
                     )

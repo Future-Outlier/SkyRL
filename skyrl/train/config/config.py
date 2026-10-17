@@ -1187,6 +1187,10 @@ SUPPORTED_SPECULATIVE_DECODING_METHODS = ("mtp",)
 class InferenceEngineConfig(BaseConfig):
     """Configuration for inference engine instantiation and management."""
 
+    logprob_output: Literal["action", "full"] = "action"
+    """Logprob values returned for training rollouts.
+    ``"action"`` returns only the sampled-token value. ``"full"`` additionally returns one
+    float32 vocabulary row per response token for IsoExec's pre-update comparison."""
     model_dtype: str = "bfloat16"
     """Should match the dtype used by the inference engine.
     Also used during full-weight sync, where policy weights are cast to this dtype before being sent
@@ -1298,8 +1302,8 @@ class InferenceEngineConfig(BaseConfig):
     engine_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine.
     Names must match the engine's args. Applied last, so they silently override config-derived
-    engine args (e.g. ``tensor_parallel_size``). The exception is ``logprobs_mode``, which is
-    always ``"processed_logprobs"``; any other value is rejected.
+    engine args (e.g. ``tensor_parallel_size``). The exception is ``logprobs_mode``: normal SkyRL
+    requires ``"processed_logprobs"`` and the IsoExec opt-in requires ``"raw_logprobs"``.
 
     For HuggingFace config overrides such as RoPE scaling, use
     ``engine_init_kwargs.hf_overrides.rope_parameters`` and set the matching trainer-side override
@@ -1326,8 +1330,8 @@ class InferenceEngineConfig(BaseConfig):
     """Pass-through kwargs for the vLLM engine, applied only to prefill engines when
     ``enable_pd=True``. Mutually exclusive with ``engine_init_kwargs``: provide role-specific
     kwargs (including shared ones like ``kv_transfer_config``) via ``prefill_init_kwargs`` /
-    ``decode_init_kwargs`` instead. As with ``engine_init_kwargs``, ``logprobs_mode`` must be
-    ``"processed_logprobs"``."""
+    ``decode_init_kwargs`` instead. As with ``engine_init_kwargs``, ``logprobs_mode`` must match
+    the mode resolved for the engine."""
     decode_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine, applied only to decode engines when
     ``enable_pd=True``. Mutually exclusive with ``engine_init_kwargs`` (see ``prefill_init_kwargs``)."""
@@ -1484,6 +1488,9 @@ class TrainerConfig(BaseConfig):
     ``"fsdp"`` uses PyTorch's composable ``fully_shard`` API (formerly known as FSDP2)."""
     enable_isoexec: bool = False
     """Build trainer and rollout models through the installed IsoExec package."""
+    rollout_logprob_comparison: Literal["action", "full"] = "action"
+    """Rollout-versus-trainer comparison performed before optimizer mutation.
+    ``"full"`` requires matching ``generator.inference_engine.logprob_output`` and IsoExec."""
     isoexec_model: Optional[Dict[str, Any]] = None
     """V2 ModelSource plus optional revision, raw config, and placement mappings."""
     policy: PolicyConfig = field(default_factory=PolicyConfig)

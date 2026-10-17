@@ -992,7 +992,13 @@ class RayPPOTrainer:
                 "image_grid_thw": image_grid_thw,
             },
         )
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            from isoexec.integrations.skyrl.full_distribution import attach_rollout_rows
+
+            attach_rollout_rows(training_input, generator_output, response_ids, response_masks_tensor.shape[1])
         training_input.metadata = {"uids": uids}
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            training_input.metadata["global_step"] = int(self.global_step)
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 
@@ -1359,6 +1365,8 @@ class RayPPOTrainer:
         is anchor-aware here rather than a static membership in LOSSES_WITHOUT_OLD_LOGPROBS, which is
         keyed by policy_loss_type and cannot distinguish the two CISPO anchors.
         """
+        if self.cfg.trainer.enable_isoexec:
+            return False
         algorithm = self.cfg.trainer.algorithm
         if algorithm.policy_loss_type == PolicyLossType.CISPO:
             # CISPO reads old logprobs only with the default "old" anchor; "rollout" optimizes against
@@ -1430,6 +1438,12 @@ class RayPPOTrainer:
 
         # Policy forward. Skipped for losses that optimize against rollout logprobs (see
         # `_skip_policy_forward`), where the resulting logprobs are never read.
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            from isoexec.integrations.skyrl.full_distribution import (
+                attach_prescore_rows,
+            )
+
+            attach_prescore_rows(training_input, data_fwd_pass)
         if self._skip_policy_forward(training_input):
             action_log_probs = None
         else:
@@ -1438,6 +1452,20 @@ class RayPPOTrainer:
                 data_fwd_pass,
                 key="logprobs",
                 mini_batch_boundaries=training_input.metadata.get("policy_mini_batch_boundaries"),
+            )
+
+        if self.cfg.trainer.enable_isoexec:
+            from isoexec.integrations.skyrl.audit import require_comparison
+
+            require_comparison(training_input, action_log_probs)
+
+        if self.cfg.trainer.rollout_logprob_comparison == "full":
+            from isoexec.integrations.skyrl.full_distribution import (
+                release_prescore_rows,
+            )
+
+            self.all_metrics["policy/full_logprobs_verified_rows"] = release_prescore_rows(
+                training_input, data_fwd_pass
             )
 
         # Empty cache after all forward passes
@@ -1460,6 +1488,11 @@ class RayPPOTrainer:
                 training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
                 - action_log_probs[training_input["loss_mask"] > 0]
             ).abs()
+
+            if self.cfg.trainer.enable_isoexec:
+                from isoexec.integrations.skyrl.audit import check_training_batch
+
+                check_training_batch(training_input, action_log_probs, logprobs_diff)
 
             # Guard: a batch with no trainable response tokens (loss_mask all zero, e.g. every
             # response dropped by overlong filtering) leaves logprobs_diff empty, and .max()/.min()
