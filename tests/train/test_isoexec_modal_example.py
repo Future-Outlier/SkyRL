@@ -1,14 +1,14 @@
 import runpy
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from skyrl.train.config import SkyRLTrainConfig
-from skyrl.train.utils.utils import validate_cfg
+from skyrl.train.utils.utils import validate_logprob_comparison
 
 
-def test_modal_example_resolves_combined_local_config(monkeypatch):
+def test_modal_example_enables_full_logprob_comparison(monkeypatch):
+    """Check the CLI profile; native runtime validation requires Linux/CUDA dependencies."""
     pytest.importorskip("modal")
     pytest.importorskip("isoexec")
     monkeypatch.delenv("MODAL_ISOEXEC_ONLY", raising=False)
@@ -20,14 +20,13 @@ def test_modal_example_resolves_combined_local_config(monkeypatch):
     entrypoint = command.index("skyrl.train.entrypoints.main_base")
     overrides = command[entrypoint + 1 :]
 
-    monkeypatch.setattr("isoexec.models.config_for", lambda path: SimpleNamespace(layers=()))
     cfg = SkyRLTrainConfig.from_cli_overrides(overrides)
-    validate_cfg(cfg)
+    validate_logprob_comparison(cfg)
 
     assert cfg.trainer.enable_isoexec is True
     assert cfg.trainer.rollout_logprob_comparison == "full"
     assert cfg.generator.inference_engine.logprob_output == "full"
-    assert cfg.trainer._isoexec_config.full_distribution_comparison is True
+    assert cfg.generator.eval_sampling_params.logprobs is None
 
 
 def test_modal_example_registers_isoexec_function_only_when_selected(monkeypatch):

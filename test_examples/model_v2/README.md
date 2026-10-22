@@ -21,6 +21,8 @@ The shell contains the complete configuration: trainer TP2/SP/dense DP2,
 two independent inference engines each using TP2 and the same PP, BF16,
 text-only, MTP/speculation off, and LoRA rank 0. The V2 source is
 `isoexec.models.v2.qwen3_5_0_8b`; the official checkpoint revision is pinned.
+Both full-logprob settings are enabled so policy prescore compares complete FP32
+vocabulary rows before the optimizer update.
 
 This is a normal GSM8K GRPO training launch through
 `skyrl.train.entrypoints.main_base`. Data is prepared automatically if missing.

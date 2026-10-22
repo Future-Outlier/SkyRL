@@ -6,6 +6,7 @@ so the wire conventions (byte layouts, NaN/sentinel fills) are checked
 against the exact code the client runs.
 """
 
+import json
 import math
 
 import numpy as np
@@ -13,7 +14,9 @@ import pytest
 import tinker.types as sdk_types
 import zstandard
 from fastapi import HTTPException
+from pydantic import ValidationError
 from tinker import ForwardBackwardOutput, SampleResponse
+from tinker.proto import tinker_public_pb2 as pb
 from tinker.proto.request_conv import forward_backward_request_to_proto
 from tinker.proto.response_conv import deserialize_proto_response
 
@@ -124,6 +127,35 @@ def test_forward_backward_empty_outputs():
     assert output.metrics == {"loss:sum": 0.0}
 
 
+def test_forward_backward_preserves_nonfinite_metrics_from_stored_future():
+    stored = types.ForwardBackwardOutput(
+        loss_fn_output_type="scalar",
+        loss_fn_outputs=[],
+        metrics={
+            "total_loss:sum": 1.0,
+            "importance_ratio:mean": math.nan,
+            "overflow:mean": math.inf,
+            "underflow:mean": -math.inf,
+        },
+    ).model_dump_json()
+    result_data = json.loads(stored)
+    assert result_data["metrics"]["importance_ratio:mean"] == "NaN"
+    assert result_data["metrics"]["overflow:mean"] == "Infinity"
+    assert result_data["metrics"]["underflow:mean"] == "-Infinity"
+
+    output = roundtrip_forward_backward(result_data)
+    assert output.metrics["total_loss:sum"] == 1.0
+    assert math.isnan(output.metrics["importance_ratio:mean"])
+    assert output.metrics["overflow:mean"] == math.inf
+    assert output.metrics["underflow:mean"] == -math.inf
+
+
+def test_forward_backward_legacy_null_metric_is_nan():
+    result_data = {"loss_fn_output_type": "scalar", "loss_fn_outputs": [], "metrics": {"importance_ratio:mean": None}}
+    output = roundtrip_forward_backward(result_data)
+    assert math.isnan(output.metrics["importance_ratio:mean"])
+
+
 def test_forward_backward_field_missing_in_one_datum():
     result_data = {
         "loss_fn_output_type": "scalar",
@@ -212,6 +244,42 @@ def test_parse_forward_backward_request_forward_only_and_config():
     assert request_dict["forward_backward_input"]["loss_fn_config"] == {"clip_low_threshold": 0.2}
 
 
+_HAS_LOSS_FN_CONFIG_V2 = "loss_fn_config_v2" in pb.ForwardBackwardRequest.DESCRIPTOR.fields_by_name
+requires_loss_fn_config_v2 = pytest.mark.skipif(
+    not _HAS_LOSS_FN_CONFIG_V2, reason="installed tinker SDK predates loss_fn_config_v2 (0.27)"
+)
+
+
+@requires_loss_fn_config_v2
+def test_parse_forward_backward_request_prefers_v2_config():
+    """SDK >= 0.27 dual-writes loss_fn_config: numbers land in both the legacy
+    float map and loss_fn_config_v2, strings only in v2. The parser must read
+    v2 so a string value is not silently dropped."""
+    body = encode_sdk_fwd_bwd_request(loss_fn_config={"clip_low_threshold": 0.2, "mode": "token"})
+    request_dict, _ = parse_forward_backward_request(body)
+    assert request_dict["forward_backward_input"]["loss_fn_config"] == {"clip_low_threshold": 0.2, "mode": "token"}
+
+    # No SkyRL loss takes a string parameter, so the API model rejects it
+    # (rather than the value vanishing before validation).
+    with pytest.raises(ValidationError):
+        api.ForwardBackwardRequest.model_validate(request_dict)
+
+
+@requires_loss_fn_config_v2
+def test_parse_forward_backward_request_v2_only_config():
+    """A sender that populates only loss_fn_config_v2 (no legacy mirror)."""
+    msg = pb.ForwardBackwardRequest()
+    msg.ParseFromString(encode_sdk_fwd_bwd_request())
+    msg.loss_fn_config_v2["clip_low_threshold"].number = 0.2
+    msg.loss_fn_config_v2["clip_high_threshold"].number = 0.3
+    assert not msg.loss_fn_config
+    request_dict, _ = parse_forward_backward_request(msg.SerializeToString())
+    assert request_dict["forward_backward_input"]["loss_fn_config"] == {
+        "clip_low_threshold": 0.2,
+        "clip_high_threshold": 0.3,
+    }
+
+
 def test_parse_forward_backward_request_garbage_raises():
     with pytest.raises(Exception):
         parse_forward_backward_request(b"\xff\xfe not a proto")
@@ -246,8 +314,8 @@ async def test_read_forward_backward_request_zstd_proto_body():
 
 
 @pytest.mark.asyncio
-async def test_read_forward_backward_request_zstd_json_body():
-    """Content-Encoding applies to the raw body regardless of wire format."""
+async def test_read_forward_backward_request_json_body_raises_415():
+    """The JSON wire format of pre-0.25 SDKs is no longer accepted."""
     req = api.ForwardBackwardRequest(
         model_id="model_json",
         forward_backward_input=api.ForwardBackwardInput(
@@ -263,17 +331,25 @@ async def test_read_forward_backward_request_zstd_json_body():
             loss_fn="cross_entropy",
         ),
     )
-    compressed = zstandard.ZstdCompressor().compress(req.model_dump_json().encode())
-    parsed, forward_only = await api._read_forward_backward_request(
-        _StubRequest(compressed, {"content-encoding": "zstd"})
-    )
+    for content_type in (None, "application/json", "application/x-protobuf-v2", "fooapplication/x-protobuf"):
+        headers = {} if content_type is None else {"content-type": content_type}
+        with pytest.raises(HTTPException) as exc_info:
+            await api._read_forward_backward_request(_StubRequest(req.model_dump_json().encode(), headers))
+        assert exc_info.value.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_read_forward_backward_request_accepts_content_type_parameters():
+    """Media type parameters (and case) do not affect the content-type match."""
+    request = _StubRequest(encode_sdk_fwd_bwd_request(), {"content-type": "Application/X-Protobuf; charset=binary"})
+    parsed, forward_only = await api._read_forward_backward_request(request)
     assert not forward_only
-    assert parsed.model_id == "model_json"
+    assert parsed.model_id == "model_abc"
 
 
 @pytest.mark.asyncio
 async def test_read_forward_backward_request_bad_zstd_raises_422():
-    request = _StubRequest(b"\x00\x01 not zstd", {"content-encoding": "zstd"})
+    request = _StubRequest(b"\x00\x01 not zstd", {"content-type": PROTO_CONTENT_TYPE, "content-encoding": "zstd"})
     with pytest.raises(HTTPException) as exc_info:
         await api._read_forward_backward_request(request)
     assert exc_info.value.status_code == 422

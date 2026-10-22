@@ -1,6 +1,7 @@
 """Tests for the Tinker API mock server using the real tinker client."""
 
 import asyncio
+import dataclasses
 import os
 import subprocess
 import tempfile
@@ -69,6 +70,11 @@ def start_api_server(
                 "host": "0.0.0.0",
                 "port": str(TEST_SERVER_PORT),
                 "base-model": BASE_MODEL,
+                # Pinned rather than inherited from EngineConfig's default: these
+                # run on a CPU runner, and jax is the only backend that works
+                # without a GPU. `_build_uv_run_cmd_engine` turns this into
+                # `--extra <backend>` for the engine child process.
+                "backend": "jax",
                 "backend-config": '{"max_lora_adapters": 4}',
                 "database-url": f"sqlite:///{resolved_db_path}",
             }
@@ -374,11 +380,19 @@ def test_sample(service_client, use_lora):
         requests.append(request)
 
     # Verify we got the right number of sequences and tokens back
+    sequence_ids = []
     for request, num_samples, max_tokens in zip(requests, num_samples_per_request, max_tokens_per_request):
         sample_result = request.result()
         assert sample_result is not None
         assert len(sample_result.sequences) == num_samples
         assert len(sample_result.sequences[0].tokens) == max_tokens
+        sequence_ids.extend(getattr(seq, "sequence_id", None) for seq in sample_result.sequences)
+    # tinker>=0.26 stamps the ids the asample promise returned onto each
+    # sequence; one distinct id per sample across the session. Older SDKs
+    # have no ``sequence_id`` field and ignore the promise's ids.
+    if "sequence_id" in {f.name for f in dataclasses.fields(types.SampledSequence)}:
+        assert all(sequence_ids)
+        assert len(set(sequence_ids)) == len(sequence_ids)
 
     # Test stop tokens: generate once, then use the 5th token as a stop token
     initial_result = sampling_client.sample(
@@ -560,7 +574,13 @@ def test_unload_model(api_server):
         async with tinker._client.AsyncTinker(
             api_key=TINKER_API_KEY, base_url=f"http://0.0.0.0:{TEST_SERVER_PORT}/"
         ) as client:
-            future = await client.models.unload(request=types.UnloadModelRequest(model_id=training_client.model_id))
+            # tinker>=0.26 dropped ``client.models.unload`` (the request/response
+            # types remain), so post to the endpoint through the generic client.
+            future = await client.post(
+                "/api/v1/unload_model",
+                body=types.UnloadModelRequest(model_id=training_client.model_id).model_dump(mode="json"),
+                cast_to=types.UntypedAPIFuture,
+            )
             while True:
                 # NOTE: ``futures.retrieve`` casts to the ``FutureRetrieveResponse``
                 # union, which has no discriminator. tinker>=0.17 resolves such a

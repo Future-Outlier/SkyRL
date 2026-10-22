@@ -16,7 +16,7 @@ This client is responsible for BOTH data plane and control plane operations:
 
 2. Control Plane (fan-out to all server_urls):
    - pause, resume, sleep, wake_up, reset_prefix_cache
-   - init_weight_transfer, update_weights_skyrl
+   - update_weights, fetch_weights, load/unload_lora_adapter, get_world_size
    - Fans out directly to all backend servers (bypassing router)
    - This allows using external routers that only handle data plane
 
@@ -28,7 +28,7 @@ Key features:
 - Two URL types:
   - proxy_url: Single URL for data plane operations (routed requests)
   - server_urls: List of backend URLs for control plane operations (fan-out)
-- Lazy world_size fetching from /get_server_info
+- Lazy world_size fetching from /get_world_size, cached after the first call
 - Keep-mode pause: in-flight requests are frozen by the vLLM scheduler and
   resume where they left off after /resume. No client-side retry needed.
 
@@ -47,13 +47,16 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
-    TYPE_CHECKING,
     Any,
+    AsyncIterator,
     Dict,
+    Iterable,
     List,
     Literal,
     Optional,
@@ -64,7 +67,10 @@ from typing import (
 )
 
 import aiohttp
+import numpy as np
 import orjson
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 from skyrl.backends.skyrl_train.inference_servers.base import (
     InferenceEngineInput,
@@ -74,16 +80,24 @@ from skyrl.backends.skyrl_train.inference_servers.base import (
     MultiModalFeatures,
 )
 from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
+    PackedField,
     decode_packed_full_logprobs,
     decode_packed_routed_experts,
+    decode_packed_sample_support,
+    load_packed_body,
 )
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
+from skyrl.backends.skyrl_train.utils.sample_support import SampleSupport
 from skyrl.backends.utils import convert_vllm_prompt_logprobs
 from skyrl.env_vars import (
     SKYRL_GENERATE_CONCURRENCY_PER_ENGINE,
     SKYRL_HTTP_CONNECTION_LIMIT,
+    SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S,
 )
+from skyrl.train.utils import deadline
 
 _DATA_PLANE_RETRIES = 30
+_VLLM_FINAL_ONLY_OUTPUT_KIND = 2  # RequestOutputKind.FINAL_ONLY, without importing the GPU runtime.
 
 SKYRL_LORA_ADAPTER_NAME = "skyrl-lora"
 """Default LoRA adapter name used for single-LoRA training inside SkyRL."""
@@ -98,17 +112,86 @@ _TINKER_SAMPLE_TO_VLLM_PARAM_MAP = {
     "stop_tokens": "stop_token_ids",
 }
 
-if TYPE_CHECKING:
-    from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
-        WeightSyncInitInfo,
-    )
-
-
 logger = logging.getLogger(__name__)
 
-# RequestOutputKind.FINAL_ONLY on vLLM's wire protocol. Keep this client usable
-# without importing the serving runtime into the trainer process.
-_VLLM_FINAL_ONLY_OUTPUT_KIND = 2
+
+class InferenceServerHTTPError(aiohttp.ClientResponseError):
+    """A picklable ``ClientResponseError`` for an HTTP error from an inference server.
+
+    aiohttp's own error holds ``CIMultiDictProxy`` request info and headers, which can't be pickled, so Ray
+    replaces it with a bare ``RayError``. This keeps only plain fields and rebuilds the rest on unpickle.
+    """
+
+    def __init__(
+        self,
+        method: str,
+        url: str,
+        status: int,
+        message: str,
+        headers: Optional[Iterable[Tuple[str, str]]] = None,
+    ) -> None:
+        request_info = aiohttp.RequestInfo(URL(url), method, CIMultiDictProxy(CIMultiDict()), URL(url))
+        super().__init__(request_info, (), status=status, message=message, headers=CIMultiDict(headers or ()))
+
+    @classmethod
+    def from_response(cls, resp: aiohttp.ClientResponse, message: str) -> "InferenceServerHTTPError":
+        return cls(resp.method, str(resp.url), resp.status, message, resp.headers.items())
+
+    def __reduce__(self):
+        # ClientResponseError forces args=(request_info, history), so the default reduce can't rebuild it.
+        args = (
+            self.request_info.method,
+            str(self.request_info.url),
+            self.status,
+            self.message,
+            list(self.headers.items()),
+        )
+        notes = getattr(self, "__notes__", None)
+        return type(self), args, {"__notes__": notes} if notes else None
+
+
+class InferenceServerTimeoutError(RuntimeError):
+    """A control-plane request exceeded ``SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S``.
+
+    Not a ``TimeoutError``, so ``except TimeoutError`` retry handlers don't swallow it.
+    """
+
+    def __init__(self, method: str, url: str, timeout_s: float) -> None:
+        # All fields go to args so the default BaseException pickling round-trips them.
+        super().__init__(method, url, timeout_s)
+        self.method = method
+        self.url = url
+        self.timeout_s = timeout_s
+
+    def __str__(self) -> str:
+        return (
+            f"{self.method} {self.url} did not complete within {self.timeout_s:g}s "
+            "(SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S)"
+        )
+
+
+@contextlib.asynccontextmanager
+async def _control_plane_request(
+    session: aiohttp.ClientSession, method: str, url: str, **kwargs: Any
+) -> AsyncIterator[aiohttp.ClientResponse]:
+    """``session.request`` bounded by ``SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S``."""
+    timeout_s = SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S
+    timeout = aiohttp.ClientTimeout(total=timeout_s if timeout_s > 0 else None)
+    try:
+        async with session.request(method, url, timeout=timeout, **kwargs) as resp:
+            yield resp
+    except asyncio.TimeoutError:
+        raise InferenceServerTimeoutError(method, url, timeout_s) from None
+
+
+async def _read_json_body(resp: aiohttp.ClientResponse) -> Any:
+    """Read JSON, preserving the HTTP error when an error response is not valid JSON."""
+    try:
+        return await resp.json()
+    except (aiohttp.ContentTypeError, json.JSONDecodeError):
+        if resp.status >= 400:
+            raise InferenceServerHTTPError.from_response(resp, await resp.text() or resp.reason) from None
+        raise
 
 
 def _extract_session_id_and_body(
@@ -172,6 +255,237 @@ class SampleResponse(TypedDict):
     topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]]
 
 
+@dataclass(frozen=True)
+class RemoteGenerateResult:
+    """Raw token generation result returned by ``RemoteGenerateClient``."""
+
+    raw_response: Dict[str, Any]
+    response_ids: List[int]
+    response_logprobs: Optional[List[float]]
+    full_logprobs: Optional[np.ndarray]
+    stop_reason: str
+    routed_experts: Optional[RoutedExpertIndices]
+    sample_support: Optional[SampleSupport]
+
+
+@dataclass
+class RemoteGenerateClient:
+    """Reusable HTTP client for one raw-token generation request."""
+
+    proxy_url: str
+    # aiohttp.ClientSession is bound to the event loop that created it, so one session is kept per loop.
+    _sessions: Dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    async def _drop_closed_loop_sessions(self) -> None:
+        """Close stale sessions without disturbing pools owned by live loops."""
+        for loop in list(self._sessions):
+            if loop.is_closed():
+                session = self._sessions.pop(loop)
+                await session.close()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create the aiohttp session bound to the running event loop.
+
+        Sessions are kept per loop so a call on one loop never replaces or
+        closes a session that another live loop (e.g. the Tinker engine's
+        continuous sampler thread) is still using.
+        """
+        await self._drop_closed_loop_sessions()
+        current_loop = asyncio.get_running_loop()
+        session = self._sessions.get(current_loop)
+        if session is None or session.closed:
+            # keepalive_timeout must be shorter than the server's timeout_keep_alive
+            # (uvicorn default: 5s). Otherwise aiohttp reuses connections the server
+            # has already closed, causing ECONNRESET under high concurrency.
+            connector = aiohttp.TCPConnector(
+                limit=SKYRL_HTTP_CONNECTION_LIMIT,
+                keepalive_timeout=2,
+            )
+            session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None))
+            self._sessions[current_loop] = session
+        return session
+
+    async def _post(
+        self,
+        url: str,
+        json: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None,
+        *,
+        packed_side_channels: bool = False,
+    ) -> Any:
+        """POST JSON with retries, optionally splicing packed arrays before parsing."""
+        session = await self._get_session()
+        last_exc: Optional[Exception] = None
+        for attempt in range(_DATA_PLANE_RETRIES):
+            try:
+                async with session.post(url, json=json, headers=headers) as resp:
+                    try:
+                        raw = await resp.read()
+                        body = load_packed_body(raw) if packed_side_channels else orjson.loads(raw)
+                    except orjson.JSONDecodeError as exc:
+                        if 400 <= resp.status < 500:
+                            text = await resp.text()
+                            raise InferenceServerHTTPError.from_response(resp, text or resp.reason) from exc
+                        last_exc = exc
+                        # The bare JSONDecodeError says only "line 1 column 1 (char 0)", which
+                        # gives no hint whether the body was empty, an HTML error page, or a
+                        # plain-text 5xx. Capture the status and a snippet so a failure here is
+                        # diagnosable from the log alone (e.g. a 502 from the router when the
+                        # engine behind it has died).
+                        try:
+                            text = await resp.text()
+                        except Exception:  # noqa: BLE001 - body may be unreadable
+                            text = "<unreadable>"
+                        logger.warning(
+                            f"non-JSON response from {url} on attempt "
+                            f"{attempt + 1}/{_DATA_PLANE_RETRIES}: status={resp.status} "
+                            f"len={len(text)} body={text[:500]!r}"
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    raise_for_status(resp, body)
+                    return body
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as exc:
+                last_exc = exc
+                logger.debug(f"POST retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {exc}")
+                await asyncio.sleep(1)
+        if last_exc is None:
+            raise RuntimeError(f"POST failed without an exception for {url=}")
+        raise last_exc
+
+    async def generate(
+        self,
+        *,
+        prompt_token_ids: List[int],
+        sampling_params: Dict[str, Any],
+        session_id: Optional[Any],
+        model: str,
+        return_routed_experts: bool = False,
+        routed_experts_prompt_start: Optional[int] = None,
+        return_sample_support: bool = False,
+        return_full_logprobs: bool = False,
+        mm_features: Optional[MultiModalFeatures] = None,
+        cache_salt: Optional[str] = None,
+    ) -> RemoteGenerateResult:
+        """Generate one raw-token completion with optional per-token replay metadata."""
+        if routed_experts_prompt_start is not None:
+            if not return_routed_experts:
+                raise ValueError("routed_experts_prompt_start requires return_routed_experts=True")
+            if (
+                isinstance(routed_experts_prompt_start, bool)
+                or not isinstance(routed_experts_prompt_start, int)
+                or not 0 <= routed_experts_prompt_start <= len(prompt_token_ids)
+            ):
+                raise ValueError("routed_experts_prompt_start must be an integer within the prompt")
+
+        if return_full_logprobs and (return_sample_support or mm_features):
+            raise ValueError("full logprobs require text-only generation without sample-support capture")
+
+        packed_side_channels = return_routed_experts or return_sample_support or return_full_logprobs
+        path = "/skyrl/v1/generate" if packed_side_channels else "/inference/v1/generate"
+        request_sampling_params = {**sampling_params, "output_kind": _VLLM_FINAL_ONLY_OUTPUT_KIND}
+        if return_full_logprobs:
+            request_sampling_params["logprobs"] = -1
+            if not request_sampling_params.get("stop"):
+                request_sampling_params["detokenize"] = False
+        if routed_experts_prompt_start is not None:
+            request_sampling_params["routed_experts_prompt_start"] = routed_experts_prompt_start
+        payload: Dict[str, Any] = {
+            "sampling_params": request_sampling_params,
+            "model": model,
+            "token_ids": prompt_token_ids,
+        }
+        if return_sample_support:
+            payload["return_sample_support"] = True
+        if return_full_logprobs:
+            payload["return_full_logprobs"] = True
+        if mm_features:
+            payload["features"] = mm_features
+        # `cache_salt` is a top-level request field (forwarded to vLLM's TokensPrompt), not a sampling
+        # param.
+        if cache_salt is not None:
+            payload["cache_salt"] = cache_salt
+
+        headers = {"Content-Type": "application/json"}
+        if session_id:
+            headers["X-Session-ID"] = str(session_id)
+
+        response = await self._post(
+            f"{self.proxy_url}{path}",
+            json=payload,
+            headers=headers,
+            packed_side_channels=packed_side_channels,
+        )
+        choice = response["choices"][0]
+        token_ids = choice["token_ids"]
+        logprobs = choice.get("logprobs")
+        response_logprobs = None
+        if logprobs is not None:
+            logprobs_content = logprobs.get("content", [])
+            if logprobs_content:
+                response_logprobs = [logprob_info["logprob"] for logprob_info in logprobs_content]
+
+        routed_experts = None
+        if return_routed_experts:
+            packed_routed_experts = choice.get(PackedField.ROUTED_EXPERTS)
+            if not isinstance(packed_routed_experts, dict):
+                raise ValueError("/skyrl/v1/generate must return packed routed_experts")
+            routed_experts = decode_packed_routed_experts(packed_routed_experts)
+
+        sample_support = None
+        if return_sample_support:
+            packed_sample_support = choice.get(PackedField.ROLLOUT_SAMPLE_SUPPORT)
+            if not isinstance(packed_sample_support, dict):
+                raise ValueError("/skyrl/v1/generate must return packed rollout_sample_support")
+            sample_support = decode_packed_sample_support(packed_sample_support)
+
+        full_logprobs = None
+        if return_full_logprobs:
+            packed_full_logprobs = choice.get(PackedField.FULL_LOGPROBS)
+            full_logprobs = decode_packed_full_logprobs(packed_full_logprobs)
+            if full_logprobs.shape[0] != len(token_ids) or response_logprobs is None:
+                raise ValueError("full and sampled logprobs must match the response token count")
+            sampled = full_logprobs[np.arange(len(token_ids)), token_ids]
+            action = np.asarray(response_logprobs, dtype="<f4")
+            if sampled.tobytes() != action.tobytes():
+                raise ValueError("sampled logprobs differ from their full-vocabulary entries")
+
+        return RemoteGenerateResult(
+            raw_response=response,
+            response_ids=token_ids,
+            response_logprobs=response_logprobs,
+            full_logprobs=full_logprobs,
+            stop_reason=choice["finish_reason"],
+            routed_experts=routed_experts,
+            sample_support=sample_support,
+        )
+
+    async def aclose(self) -> None:
+        """Close the session bound to the running event loop.
+
+        Sessions owned by other live loops are left untouched; they can only be
+        closed from their own loop.
+        """
+        await self._drop_closed_loop_sessions()
+        session = self._sessions.pop(asyncio.get_running_loop(), None)
+        if session is not None and not session.closed:
+            try:
+                await session.close()
+            except Exception as e:
+                logger.warning(f"Encountered exception {e} while closing client session")
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_sessions"] = {}
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._sessions = {}
+
+
 @dataclass
 class RemoteInferenceClient(InferenceEngineInterface):
     """
@@ -220,6 +534,13 @@ class RemoteInferenceClient(InferenceEngineInterface):
     enable_return_routed_experts: bool = False
     """Whether to return routed expert indices (R3 / rollout router replay)."""
 
+    enable_return_sample_support_set: bool = False
+    """Whether the engine may return the sampler's bounded top-k support per generated token.
+    Capture is per-request: callers opt a batch in with ``InferenceEngineInput.return_sample_support``."""
+
+    logprob_output: Literal["action", "full"] = "action"
+    """Return sampled-token logprobs only, or sampled-token values plus complete vocabulary rows."""
+
     uses_lora_weight_sync: bool = False
     """True when the trainer syncs LoRA adapters (rather than full/merged weights). When True,
     `sleep()` is forced to level=1: level=2 discards the base model from VRAM with no CPU backup,
@@ -229,17 +550,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
     tokenizer: Optional[Any] = None
     """Optional HF tokenizer for local tokenize/detokenize (avoids HTTP round-trips)."""
 
-    logprob_output: Literal["action", "full"] = "action"
-
-    uses_isoexec: bool = False
-    """Whether inference workers are running the local IsoExec host integration."""
-
-    preserve_weights_on_sleep: bool = False
-    """Force level-1 sleep when IsoExec owns derived model state that level 2 would discard."""
-
     # Private fields excluded from repr for cleaner output
-    # aiohttp.ClientSession is bound to the event loop that created it, so one session is kept per loop.
-    _sessions: Dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = field(default_factory=dict, repr=False)
+    _generate_client: Optional[RemoteGenerateClient] = field(default=None, repr=False)
     _world_size: Optional[Tuple[int, int]] = field(default=None, repr=False)
     _gen_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _detok_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
@@ -296,75 +608,16 @@ class RemoteInferenceClient(InferenceEngineInterface):
             self._sem_loop = current_loop
         return self._gen_sem, self._detok_sem
 
-    async def _drop_closed_loop_sessions(self) -> None:
-        """Close sessions whose owning loop has ended, retaining other live loops' pools."""
-        for loop in list(self._sessions):
-            if loop.is_closed():
-                session = self._sessions.pop(loop)
-                await session.close()
+    def _get_generate_client(self) -> RemoteGenerateClient:
+        if self._generate_client is None:
+            self._generate_client = RemoteGenerateClient(proxy_url=self.proxy_url)
+        return self._generate_client
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the aiohttp session bound to the running event loop.
-
-        Sessions are kept per loop so a call on one loop never replaces or
-        closes a session that another live loop (e.g. the Tinker engine's
-        continuous sampler thread) is still using.
-        """
-        await self._drop_closed_loop_sessions()
-        current_loop = asyncio.get_running_loop()
-        session = self._sessions.get(current_loop)
-        if session is None or session.closed:
-            # keepalive_timeout must be shorter than the server's timeout_keep_alive
-            # (uvicorn default: 5s). Otherwise aiohttp reuses connections the server
-            # has already closed, causing ECONNRESET under high concurrency.
-            connector = aiohttp.TCPConnector(
-                limit=SKYRL_HTTP_CONNECTION_LIMIT,
-                keepalive_timeout=2,
-            )
-            session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None))
-            self._sessions[current_loop] = session
-        return session
+        return await self._get_generate_client()._get_session()
 
     async def _post(self, url: str, json: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Any:
-        """POST with retry + backoff on transient connection errors.
-
-        Between generate bursts the pool's keep-alive connections go stale
-        (server closes them after ``timeout_keep_alive``).  An immediate
-        retry would grab another stale connection from the same pool, so we
-        sleep briefly to let the connector detect and purge dead sockets
-        before the next attempt.
-        """
-        session = await self._get_session()
-        last_exc: Optional[Exception] = None
-        for attempt in range(_DATA_PLANE_RETRIES):
-            try:
-                async with session.post(url, json=json, headers=headers) as resp:
-                    try:
-                        body = orjson.loads(await resp.read())
-                    except orjson.JSONDecodeError as e:
-                        if 400 <= resp.status < 500:
-                            # Non-JSON client error (e.g. plain text 422 from vllm-router).
-                            # Raise immediately — client errors won't succeed on retry.
-                            text = await resp.text()
-                            raise aiohttp.ClientResponseError(
-                                resp.request_info,
-                                resp.history,
-                                status=resp.status,
-                                message=text or resp.reason,
-                                headers=resp.headers,
-                            )
-                        last_exc = e
-                        logger.debug(f"retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {e}")
-                        await asyncio.sleep(1)
-                        continue
-                    raise_for_status(resp, body)
-                    return body
-            except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
-                last_exc = e
-                logger.debug(f"POST retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {e}")
-                await asyncio.sleep(1)
-                continue
-        raise last_exc  # type: ignore[misc]
+        return await self._get_generate_client()._post(url, json=json, headers=headers)
 
     # ---------------------------
     # Data Plane
@@ -422,17 +675,24 @@ class RemoteInferenceClient(InferenceEngineInterface):
         if prompt_token_ids is None:
             raise ValueError("RemoteInferenceClient only accepts `prompt_token_ids`, not `prompts`.")
 
-        sampling_params = dict(input_batch.get("sampling_params") or {})
+        sampling_params = input_batch.get("sampling_params") or {}
         if sampling_params.get("n", 1) > 1:
             raise ValueError("n > 1 is not supported. Use `config.generator.n_samples_per_prompt` instead.")
-        # This batch API returns only completed responses. Cumulative output
-        # would construct and discard growing token/logprob lists every step.
-        sampling_params["output_kind"] = _VLLM_FINAL_ONLY_OUTPUT_KIND
 
         session_ids = input_batch.get("session_ids")
         mm_features = input_batch.get("mm_features")
         cache_salt = input_batch.get("cache_salt")
+        routed_experts_prompt_starts = input_batch.get("routed_experts_prompt_starts")
+        if routed_experts_prompt_starts is not None:
+            if not self.enable_return_routed_experts:
+                raise ValueError("routed_experts_prompt_starts requires enable_return_routed_experts=True")
+            if len(routed_experts_prompt_starts) != len(prompt_token_ids):
+                raise ValueError("routed_experts_prompt_starts must have one entry per prompt")
+        return_sample_support = self.enable_return_sample_support_set and input_batch.get(
+            "return_sample_support", False
+        )
         get_logprobs = sampling_params.get("logprobs") is not None
+        return_full_logprobs = self.logprob_output == "full" and get_logprobs
 
         # Two semaphores decouple the generate and detokenize stages:
         #   gen_sem:   limits concurrent in-flight generate requests so we don't
@@ -455,6 +715,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     sampling_params=sampling_params,
                     session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
                     mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
+                    routed_experts_prompt_start=(
+                        routed_experts_prompt_starts[idx] if routed_experts_prompt_starts is not None else None
+                    ),
+                    return_sample_support=return_sample_support,
+                    return_full_logprobs=return_full_logprobs,
                     model=model,
                     cache_salt=cache_salt,
                 )
@@ -464,6 +729,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     sampling_params=sampling_params,
                     session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
                     mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
+                    routed_experts_prompt_start=(
+                        routed_experts_prompt_starts[idx] if routed_experts_prompt_starts is not None else None
+                    ),
+                    return_sample_support=return_sample_support,
+                    return_full_logprobs=return_full_logprobs,
                     model=model,
                     cache_salt=cache_salt,
                 )
@@ -472,12 +742,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
             if not sampling_params.get("detokenize", True):
                 return ""
             if self.tokenizer is not None:
-                # The token-only wire response has no engine-rendered text.
-                # Match vLLM's text default without changing public detokenize().
                 return self.tokenizer.decode(
-                    token_ids, skip_special_tokens=sampling_params.get("skip_special_tokens", True)
+                    token_ids,
+                    skip_special_tokens=sampling_params.get("skip_special_tokens", True),
+                    spaces_between_special_tokens=sampling_params.get("spaces_between_special_tokens", True),
                 )
-            # The remote /detokenize protocol has no decoding-options fields.
             if detok_sem is None:
                 return (await self.detokenize([token_ids]))[0]
             async with detok_sem:
@@ -489,17 +758,22 @@ class RemoteInferenceClient(InferenceEngineInterface):
         rollout_expert_indices = (
             [result["routed_experts"] for result in raw_results] if self.enable_return_routed_experts else None
         )
+        rollout_sample_support = (
+            [result[PackedField.ROLLOUT_SAMPLE_SUPPORT] for result in raw_results] if return_sample_support else None
+        )
+        response_full_logprobs = (
+            [result[PackedField.FULL_LOGPROBS] for result in raw_results] if return_full_logprobs else None
+        )
 
-        result = InferenceEngineOutput(
+        return InferenceEngineOutput(
             responses=responses,
             stop_reasons=[r["stop_reason"] for r in raw_results],
             response_ids=[r["response_ids"] for r in raw_results],
             response_logprobs=[r["response_logprobs"] for r in raw_results] if get_logprobs else None,
+            response_full_logprobs=response_full_logprobs,
             rollout_expert_indices=rollout_expert_indices,
+            rollout_sample_support=rollout_sample_support,
         )
-        if self.logprob_output == "full" and get_logprobs:
-            result["response_full_logprobs"] = [r["response_full_logprobs"] for r in raw_results]
-        return result
 
     async def _generate_single(
         self,
@@ -509,85 +783,30 @@ class RemoteInferenceClient(InferenceEngineInterface):
         model: str,
         mm_features: Optional[MultiModalFeatures] = None,
         cache_salt: Optional[str] = None,
+        routed_experts_prompt_start: Optional[int] = None,
+        return_sample_support: bool = False,
+        return_full_logprobs: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Generate completion for a single prompt.
-
-        With keep-mode pause, in-flight requests are frozen by the vLLM
-        scheduler and resume where they left off after /resume. No retry
-        logic is needed.
-
-        Returns:
-            Dict with keys: stop_reason, response_ids, response_logprobs
-        """
-        full_logprobs = self.logprob_output == "full" and sampling_params.get("logprobs") is not None
-        if full_logprobs:
-            if mm_features or self.uses_lora_weight_sync:
-                raise ValueError("full logprobs require text-only generation without LoRA")
-            sampling_params = {**sampling_params, "logprobs": -1}
-            # The packed diagnostic returns token IDs and float32 values, not decoded
-            # vocabulary strings. Avoid decoding V tokens for every generated token.
-            # String stop conditions still require vLLM's detokenizer.
-            if not sampling_params.get("stop"):
-                sampling_params["detokenize"] = False
-        url = (
-            f"{self.proxy_url}/skyrl/v1/generate"
-            if self.enable_return_routed_experts or full_logprobs
-            else f"{self.proxy_url}/inference/v1/generate"
+        result = await self._get_generate_client().generate(
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            session_id=session_id,
+            model=model,
+            return_routed_experts=self.enable_return_routed_experts,
+            routed_experts_prompt_start=routed_experts_prompt_start,
+            return_sample_support=return_sample_support,
+            return_full_logprobs=return_full_logprobs,
+            mm_features=mm_features,
+            cache_salt=cache_salt,
         )
-
-        payload: dict[str, Any] = {
-            "sampling_params": sampling_params,
-            "model": model,
-            "token_ids": prompt_token_ids,
+        return {
+            "stop_reason": result.stop_reason,
+            "response_ids": result.response_ids,
+            "response_logprobs": result.response_logprobs,
+            PackedField.FULL_LOGPROBS.value: result.full_logprobs,
+            "routed_experts": result.routed_experts,
+            PackedField.ROLLOUT_SAMPLE_SUPPORT.value: result.sample_support,
         }
-        if full_logprobs:
-            payload["return_full_logprobs"] = True
-        if mm_features:
-            payload["features"] = mm_features
-        # `cache_salt` is a top-level request field (forwarded to vLLM's TokensPrompt), not a sampling
-        # param.
-        if cache_salt is not None:
-            payload["cache_salt"] = cache_salt
-
-        headers = {"Content-Type": "application/json"}
-        if session_id:
-            headers["X-Session-ID"] = str(session_id)
-
-        response = await self._post(url, json=payload, headers=headers)
-
-        if full_logprobs and len(response["choices"]) != 1:
-            raise ValueError("full logprobs require exactly one output")
-        choice = response["choices"][0]
-        token_ids = choice["token_ids"]
-        stop_reason = choice["finish_reason"]
-
-        response_logprobs: Optional[List[float]] = None
-        logprobs = choice.get("logprobs")
-        if logprobs is not None:
-            logprobs_content = logprobs.get("content", [])
-            if logprobs_content or full_logprobs:
-                response_logprobs = [logprob_info["logprob"] for logprob_info in logprobs_content]
-
-        routed_experts = None
-        if self.enable_return_routed_experts:
-            packed_routed_experts = choice.get("routed_experts")
-            if not isinstance(packed_routed_experts, dict):
-                raise ValueError("/skyrl/v1/generate must return packed routed_experts")
-            routed_experts = decode_packed_routed_experts(packed_routed_experts)
-
-        result = {
-            "stop_reason": stop_reason,
-            "response_ids": token_ids,
-            "response_logprobs": response_logprobs,
-            "routed_experts": routed_experts,
-        }
-        if full_logprobs:
-            rows = decode_packed_full_logprobs(choice.get("full_logprobs"))
-            if rows.shape[0] != len(token_ids) or response_logprobs is None or len(response_logprobs) != len(token_ids):
-                raise ValueError("full and sampled logprobs must match response token count")
-            result["response_full_logprobs"] = rows
-        return result
 
     async def _render_for_sample(
         self,
@@ -1011,8 +1230,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         session = await self._get_session()
         url = f"{server_url}{endpoint}"
-        async with session.request(method, url, json=json, params=params) as resp:
-            body = await resp.json() if resp.content_length else None
+        async with _control_plane_request(session, method, url, json=json, params=params) as resp:
+            body = await _read_json_body(resp) if resp.content_length else None
             raise_for_status(resp, body)
             return server_url, {"status": resp.status, "body": body}
 
@@ -1035,17 +1254,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Returns:
             Dict mapping server_url to response.
         """
-        results = await asyncio.gather(
-            *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls]
-        )
+        with deadline.operation(endpoint):
+            results = await asyncio.gather(
+                *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls]
+            )
         return {url: resp for url, resp in results}
-
-    async def collective_rpc(self, method: str, kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Call a worker extension method on every server and preserve per-server responses."""
-        payload = {"method": method}
-        if kwargs is not None:
-            payload["kwargs"] = kwargs
-        return await self._call_all_servers("/collective_rpc", payload)
 
     async def pause(self, mode: Union[PauseMode, str] = PauseMode.KEEP, clear_cache: bool = False) -> Dict[str, Any]:
         """
@@ -1085,7 +1298,6 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """Resume after pause."""
         return await self.resume()
 
-
     async def sleep(self, level: int = 2, tags: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Put all backends to sleep (offload weights to CPU).
@@ -1101,15 +1313,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
         # Mirror BaseVLLMInferenceEngine.sleep: when the trainer syncs LoRA adapters
         # only, force level=1 so the base model survives via CPU backup. level=2
         # discards weights with no source to restore from on wake_up(["weights"]).
-        if (self.uses_lora_weight_sync or self.preserve_weights_on_sleep) and level != 1:
+        if self.uses_lora_weight_sync and level != 1:
             logger.info(
-                "Forcing sleep level=1 to preserve model weights and derived state; requested level=%d.",
-                level,
-            )
-            level = 1
-        if self.preserve_weights_on_sleep and level != 1:
-            logger.info(
-                "Forcing sleep level=1 (preserve_weights_on_sleep=True); requested level=%d.",
+                "Forcing sleep level=1 (uses_lora_weight_sync=True); requested level=%d would discard the base model.",
                 level,
             )
             level = 1
@@ -1127,12 +1333,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 Common tags: ["weights"], ["kv_cache"], or None for all.
         """
         params = {"tags": tags} if tags else {}
-        result = await self._call_all_servers("/wake_up", params=params)
-        if self.uses_isoexec:
-            from isoexec.integrations.skyrl.inference import verify_after_wake
-
-            await verify_after_wake(self, tags)
-        return result
+        return await self._call_all_servers("/wake_up", params=params)
 
     async def sleep_for_weight_sync(self, offload_kv: bool = True) -> Dict[str, Any]:
         """Free GPU memory for weight sync while keeping in-flight requests frozen.
@@ -1155,15 +1356,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Wake ``["weights"]`` before the broadcast and ``["kv_cache"]`` after. Does
         not resume generation -- call :meth:`resume_generation` once KV is back.
         """
-        result = await self._call_all_servers(
+        return await self._call_all_servers(
             "/collective_rpc",
             {"method": "skyrl_wake_for_weight_sync", "kwargs": {"tags": tags}},
         )
-        if self.uses_isoexec:
-            from isoexec.integrations.skyrl.inference import verify_after_wake
-
-            await verify_after_wake(self, tags)
-        return result
 
     async def reset_prefix_cache(
         self,
@@ -1183,35 +1379,6 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # ---------------------------
     # Weight Sync (control plane - fan-out)
     # ---------------------------
-
-    async def init_weight_update_communicator(
-        self,
-        init_info: "WeightSyncInitInfo",
-    ) -> Dict[str, Any]:
-        """
-        Initialize weight sync via vLLM native /init_weight_transfer_engine.
-
-        Fetches per-server world sizes, expands init_info into per-server
-        payloads (with correct NCCL rank offsets), and fans out to all servers.
-
-        Args:
-            init_info: A WeightSyncInitInfo (e.g. BroadcastInitInfo) that supports
-                for_servers() and to_api_payload().
-
-        Returns:
-            Dict mapping server_url to response.
-        """
-        _, world_size_per_server = await self.get_world_size()
-        num_servers = len(self.server_urls)
-        server_infos = init_info.for_servers(world_size_per_server, num_servers, dp_size=self.data_parallel_size)
-        payloads = [{"init_info": x.to_api_payload()} for x in server_infos]
-        results = await asyncio.gather(
-            *[
-                self._call_server(url, "/init_weight_transfer_engine", payload)
-                for url, payload in zip(self.server_urls, payloads)
-            ]
-        )
-        return {url: resp for url, resp in results}
 
     async def update_named_weights(
         self,
@@ -1250,92 +1417,33 @@ class RemoteInferenceClient(InferenceEngineInterface):
             kwargs["uri"] = uri
         return await self._call_all_servers("/fetch_weights", kwargs)
 
-    # TODO: Migrate the main-model session after removing the SkyRL layerwise patches.
+    # The weight-sync lifecycle (/start_weight_update, /update_weights,
+    # /finish_weight_update) is driven by the trainer-side engines through the
+    # blocking SkyrlWeightSyncClient (weight_sync/control_plane.py), which they
+    # need because the protocol is synchronous and they run off the event loop.
+    # What is left here is what the driver drives: pause/resume, prefix-cache
+    # reset, /fetch_weights, LoRA, and /get_world_size at init.
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True, target: str = "model") -> Dict[str, Any]:
-        """Start a target-model session or a native vLLM draft session."""
-        from skyrl.backends.skyrl_train.weight_sync.draft_weights import (
-            validate_weight_update_target,
-        )
+    async def set_lora_receive_target(self, receive_target: Dict[str, Any]) -> Dict[str, Any]:
+        """Arm every inference worker's receive engine for one LoRA adapter round.
 
-        if validate_weight_update_target(target) == "draft":
-            if not is_checkpoint_format:
-                raise ValueError("Draft weight sync requires checkpoint-format weights")
-            return await self._call_all_servers("/start_draft_weight_update", {})
-        return await self._call_all_servers(
-            "/collective_rpc",
-            {"method": "skyrl_start_weight_update", "kwargs": {"is_checkpoint_format": is_checkpoint_format}},
-        )
-
-    async def update_weights_ipc(
-        self,
-        update_info: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Send a single weight chunk via /collective_rpc.
-
-        Calls NewInferenceWorkerWrap.update_weights_ipc on all workers.
-        Can be called multiple times between skyrl_start_weight_update and
-        skyrl_finish_weight_update.
-
-        Args:
-            update_info: Dict with backend-specific update info (names,
-                dtype_names, shapes, ipc_handles_pickled or packed flag).
-
-        Returns:
-            Dict mapping server_url to response.
+        ``lora.sync_mode=memory`` ships a PEFT adapter down the ordinary weight
+        transport, whose per-round payload carries only names, dtypes and shapes.
+        The adapter's name, config and alias map travel here instead, over
+        ``/collective_rpc``, and must land before the trainer calls
+        ``send_weights()`` (see ``weight_sync/lora_target.py``).
         """
         return await self._call_all_servers(
             "/collective_rpc",
-            {
-                "method": "update_weights_ipc",
-                "kwargs": {"update_info": update_info},
-            },
+            {"method": "skyrl_set_lora_receive_target", "kwargs": {"receive_target": receive_target}},
         )
-
-    async def update_weights_nccl(
-        self,
-        update_info: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Send batched weight update via /collective_rpc to the broadcast receiver.
-
-        Calls NewInferenceWorkerWrap.update_weights_nccl on all workers,
-        which routes weight_transfer_engine.receive_weights through the
-        set_current_vllm_config wrap. Used by the broadcast (NCCL) sender as
-        a temporary substitute for vLLM's native /update_weights endpoint
-        until the upstream patch (vllm-project/vllm weight-sync-fix) lands.
-
-        Args:
-            update_info: Dict with backend-specific update info (names,
-                dtype_names, shapes, packed flag, etc.) — same shape vLLM's
-                native /update_weights expects.
-
-        Returns:
-            Dict mapping server_url to response.
-        """
-        return await self._call_all_servers(
-            "/collective_rpc",
-            {
-                "method": "update_weights_nccl",
-                "kwargs": {"update_info": update_info},
-            },
-        )
-
-    async def finish_weight_update(self, target: str = "model") -> Dict[str, Any]:
-        """Finalize the session ``start_weight_update`` opened on ``target``."""
-        from skyrl.backends.skyrl_train.weight_sync.draft_weights import (
-            validate_weight_update_target,
-        )
-
-        if validate_weight_update_target(target) == "draft":
-            return await self._call_all_servers("/finish_weight_update", {})
-        return await self._call_all_servers("/collective_rpc", {"method": "skyrl_finish_weight_update"})
 
     async def load_lora_adapter(
         self,
         lora_name: str,
-        lora_path: str,
+        lora_path: Optional[str] = None,
+        *,
+        in_memory: bool = False,
     ) -> Dict[str, Any]:
         """
         Load (or reload) a LoRA adapter on all backend servers via the SkyRL
@@ -1359,24 +1467,34 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Args:
             lora_name: Name to register the adapter under on each server.
             lora_path: Path to the LoRA adapter on disk (must be accessible from servers).
+            in_memory: Build the adapter from tensors already staged in every
+                worker by a weight update armed with a LoRA receive target
+                (``lora.sync_mode=memory``); no path is read. Mutually exclusive
+                with ``lora_path``.
 
         Returns:
             Dict mapping server_url to response.
         """
+        if in_memory == (lora_path is not None):
+            raise ValueError("load_lora_adapter takes exactly one of lora_path or in_memory=True")
         session = await self._get_session()
 
         async def _load_on_server(server_url: str):
             url = f"{server_url}/skyrl/v1/load_lora_adapter"
-            payload = {"lora_name": lora_name, "lora_path": lora_path}
-            async with session.post(url, json=payload) as resp:
+            payload = (
+                {"lora_name": lora_name, "in_memory": True}
+                if in_memory
+                else {"lora_name": lora_name, "lora_path": lora_path}
+            )
+            async with _control_plane_request(session, "POST", url, json=payload) as resp:
                 if resp.status >= 400:
-                    body = await resp.json()
+                    body = await _read_json_body(resp)
                     raise_for_status(resp, body)
                 return server_url, {"status": resp.status, "body": await resp.text()}
 
         results = await asyncio.gather(*[_load_on_server(url) for url in self.server_urls])
 
-        logger.info(f"Loaded LoRA adapter '{lora_name}' from {lora_path}")
+        logger.info(f"Loaded LoRA adapter '{lora_name}' from {'staged GPU tensors' if in_memory else lora_path}")
 
         return {url: resp for url, resp in results}
 
@@ -1402,13 +1520,24 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         async def _unload_on_server(server_url: str):
             url = f"{server_url}/v1/unload_lora_adapter"
-            async with session.post(url, json=payload) as resp:
+            async with _control_plane_request(session, "POST", url, json=payload) as resp:
                 if resp.status >= 400:
-                    body = await resp.json()
+                    body = await _read_json_body(resp)
                     raise_for_status(resp, body)
                 return server_url, {"status": resp.status, "body": await resp.text()}
 
         results = await asyncio.gather(*[_unload_on_server(url) for url in self.server_urls])
+
+        # An adapter published with lora.sync_mode=memory also holds staged GPU
+        # tensors in every worker (kept after the load so vLLM can rebuild it
+        # after an LRU eviction). Best-effort, like the unload itself.
+        try:
+            await self._call_all_servers(
+                "/collective_rpc",
+                {"method": "skyrl_discard_in_memory_lora", "kwargs": {"lora_name": lora_name}},
+            )
+        except Exception as e:
+            logger.debug(f"Could not discard staged in-memory LoRA tensors for '{lora_name}': {e}")
 
         logger.info(f"Unloaded LoRA adapter '{lora_name}'")
 
@@ -1417,18 +1546,6 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # ---------------------------
     # Info
     # ---------------------------
-
-    async def get_gpu_uuids(self) -> Dict[str, List[str]]:
-        """Query each DP server's TP/PP workers for their current physical GPU UUIDs."""
-        results = await self._call_all_servers("/collective_rpc", {"method": "skyrl_get_gpu_uuid"})
-        gpu_uuids = {}
-        for server_url in self.server_urls:
-            response = results.get(server_url) or {}
-            uuids = (response.get("body") or {}).get("results")
-            if not isinstance(uuids, list) or not uuids or any(not isinstance(uuid, str) or not uuid for uuid in uuids):
-                raise RuntimeError(f"Missing or invalid GPU UUIDs from {server_url}: {uuids!r}")
-            gpu_uuids[server_url] = uuids
-        return gpu_uuids
 
     async def get_world_size(self) -> Tuple[int, int]:
         """
@@ -1479,8 +1596,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # ---------------------------
 
     async def teardown(self) -> None:
-        """Close the HTTP session bound to the running event loop."""
-        await self.aclose()
+        """Close HTTP session."""
+        if self._generate_client is not None:
+            await self._generate_client.aclose()
 
     async def __aenter__(self) -> "RemoteInferenceClient":
         """Async context manager entry."""
@@ -1497,7 +1615,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
     def __getstate__(self) -> dict:
         """Exclude non-serializable fields from pickle."""
         state = self.__dict__.copy()
-        state["_sessions"] = {}
+        state["_generate_client"] = None
         state["_gen_sem"] = None
         state["_detok_sem"] = None
         state["_sem_loop"] = None
@@ -1506,24 +1624,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
     def __setstate__(self, state: dict) -> None:
         """Restore state after unpickling."""
         self.__dict__.update(state)
-        self._sessions = {}
         self._gen_sem = None
         self._detok_sem = None
         self._sem_loop = None
 
-    async def aclose(self):
-        """Close the session bound to the running event loop.
-
-        Sessions owned by other live loops are left untouched; they can only be
-        closed from their own loop.
-        """
-        await self._drop_closed_loop_sessions()
-        session = self._sessions.pop(asyncio.get_running_loop(), None)
-        if session is not None and not session.closed:
-            try:
-                await session.close()
-            except Exception as e:
-                logger.warning(f"Encountered exception {e} while closing client session")
+    async def aclose(self) -> None:
+        await self.teardown()
 
     async def is_sleeping(self):
         ret = await self._call_all_servers("/is_sleeping", method="GET")
@@ -1533,18 +1639,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
 def raise_for_status(resp: aiohttp.ClientResponse, body: Optional[Any] = None) -> None:
     """Modified version of resp.raise_for_status() that reads the body for the error message.
 
-    Raises aiohttp.ClientResponseError with the error message from the body if there is an error
+    Raises InferenceServerHTTPError (a picklable aiohttp.ClientResponseError) with the error message from the body if there is an error
 
     The standard `raise_for_status()` only uses the HTTP reason phrase (e.g. "Bad Request"), which is often unhelpful. APIs typically put more descriptive error details in the response body. This function bridges that gap by surfacing the body's error message in the exception.
     """
-    if resp.status >= 400 and body is not None:
-        error_detail = body.get("error", {})
+    if resp.status >= 400:
+        error_detail = body.get("error", {}) if isinstance(body, dict) else {}
         detail_msg = error_detail.get("message", resp.reason) if isinstance(error_detail, dict) else resp.reason
-        raise aiohttp.ClientResponseError(
-            resp.request_info,
-            resp.history,
-            status=resp.status,
-            message=detail_msg,
-            headers=resp.headers,
-        )
-    resp.raise_for_status()
+        raise InferenceServerHTTPError.from_response(resp, detail_msg)

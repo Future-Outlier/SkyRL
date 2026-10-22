@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import copy
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import ray
 from loguru import logger
@@ -28,7 +30,9 @@ from .utils import (
     get_pd_cli_args,
     get_pd_p2p_connector_name,
 )
-from .vllm_router import VLLMRouter
+
+if TYPE_CHECKING:
+    from .vllm_router import VLLMRouter
 
 # Overridable per job (``SKYRL_VLLM_START_PORT``): jobs sharing a node need disjoint port blocks.
 VLLM_START_PORT = SKYRL_VLLM_START_PORT
@@ -60,6 +64,7 @@ def create_inference_servers(
     cli_args: Namespace,
     log_path: str,
     placement_group=None,
+    extra_env_vars: Optional[dict[str, str]] = None,
 ) -> InferenceServerSetup:
     """Build server groups and router from config.
 
@@ -74,6 +79,8 @@ def create_inference_servers(
         log_path: Log path for SkyRL logs
         placement_group: Optional resolved placement group for colocated
             training.  ``None`` when not colocated.
+        extra_env_vars: Environment variables that must exist before an
+            inference-server actor imports its backend.
 
     Returns:
         An :class:`InferenceServerSetup` with the router, URLs, and
@@ -125,11 +132,13 @@ def create_inference_servers(
                 placement_group_bundle_offset=i * gpus_per_server * servers_per_group,
                 enable_dp=ie_cfg.data_parallel_size > 1,
                 enable_pd=True,
+                metrics_role="prefill",
                 nixl_side_channel_base=NIXL_SIDE_CHANNEL_BASE_PORT + i * servers_per_group * SERVER_PORT_STRIDE,
                 mooncake_bootstrap_base_port=MOONCAKE_BOOTSTRAP_BASE_PORT + i * servers_per_group * SERVER_PORT_STRIDE,
                 distributed_executor_backend=ie_cfg.distributed_executor_backend,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(num_prefill)
         ]
@@ -146,6 +155,7 @@ def create_inference_servers(
                 placement_group_bundle_offset=decode_bundle_offset + i * gpus_per_server * servers_per_group,
                 enable_dp=ie_cfg.data_parallel_size > 1,
                 enable_pd=True,
+                metrics_role="decode",
                 nixl_side_channel_base=NIXL_SIDE_CHANNEL_BASE_PORT
                 + (num_prefill + i) * servers_per_group * SERVER_PORT_STRIDE,
                 mooncake_bootstrap_base_port=MOONCAKE_BOOTSTRAP_BASE_PORT
@@ -153,6 +163,7 @@ def create_inference_servers(
                 distributed_executor_backend=ie_cfg.distributed_executor_backend,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(num_decode)
         ]
@@ -230,6 +241,7 @@ def create_inference_servers(
                 placement_group_bundle_offset=i * gpus_per_server * ie_cfg.data_parallel_size,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(ie_cfg.num_engines)
         ]
@@ -304,6 +316,8 @@ def build_new_inference_client(
         logger.info(f"HTTP Inference: Using external proxy for both data and " f"control plane - proxy_url={proxy_url}")
         server_setup = InferenceServerSetup(proxy_url=proxy_url, server_urls=server_urls)
     elif has_external_servers and not has_external_proxy:
+        from .vllm_router import VLLMRouter
+
         server_urls = list(external_server_urls)
         router_args = build_router_args(ie_cfg, server_urls=server_urls)
         router = VLLMRouter(router_args, log_path=cfg.trainer.log_path)
@@ -320,29 +334,30 @@ def build_new_inference_client(
                 "external_proxy_url or external_server_urls."
             )
         cli_args = build_vllm_cli_args(cfg)
+        extra_env_vars = None
+        if cfg.trainer.enable_isoexec:
+            from isoexec.integrations.skyrl.config import engine_runtime_env
+
+            # vLLM discovers plugins while the inference actor imports vLLM.
+            # Registering the model in this driver process cannot update the
+            # separate actor's ModelRegistry, so pass the plugin opt-in through
+            # Ray's actor runtime_env before that import happens.
+            extra_env_vars = engine_runtime_env(cli_args)
         server_setup = create_inference_servers(
             ie_cfg,
             cli_args,
             log_path=cfg.trainer.log_path,
             placement_group=placement_group,
+            extra_env_vars=extra_env_vars,
         )
-
-    preserve_weights_on_sleep = False
-    if cfg.trainer.enable_isoexec:
-        from isoexec.integrations.skyrl.config import (
-            preserve_weights_on_sleep as isoexec_preserve_weights,
-        )
-
-        preserve_weights_on_sleep = isoexec_preserve_weights(cfg)
 
     client = RemoteInferenceClient(
         proxy_url=server_setup.proxy_url,
         server_urls=server_setup.server_urls,
         model_name=ie_cfg.served_model_name or cfg.trainer.policy.model.path,
         enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
+        enable_return_sample_support_set=ie_cfg.enable_return_sample_support_set,
         logprob_output=ie_cfg.logprob_output,
-        uses_isoexec=cfg.trainer.enable_isoexec,
-        preserve_weights_on_sleep=preserve_weights_on_sleep,
         uses_lora_weight_sync=_uses_lora_weight_sync(cfg),
         data_parallel_size=ie_cfg.data_parallel_size,
         tokenizer=tokenizer,

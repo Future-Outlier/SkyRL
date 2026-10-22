@@ -28,6 +28,8 @@ command=(-m skyrl.train.entrypoints.main_base
   "data.train_data=[\"$DATA_DIR/train.parquet\"]"
   "data.val_data=[\"$DATA_DIR/validation.parquet\"]"
   trainer.enable_isoexec=true
+  trainer.rollout_logprob_comparison=full
+  generator.inference_engine.logprob_output=full
   "trainer.isoexec_model=$source_config"
   trainer.strategy=megatron trainer.bf16=true
   trainer.policy.model.path=Qwen/Qwen3.5-0.8B

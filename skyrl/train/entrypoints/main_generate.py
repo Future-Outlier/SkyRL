@@ -15,7 +15,7 @@ from skyrl.train.entrypoints.main_base import (
     BasePPOExp,
     _run_with_http_client_cleanup,
 )
-from skyrl.train.evaluate import evaluate, evaluate_step_wise
+from skyrl.train.evaluate import evaluate
 from skyrl.train.utils.trainer_utils import build_dataloader
 from skyrl.train.utils.utils import initialize_ray, validate_generator_cfg
 
@@ -31,8 +31,7 @@ class EvalOnlyEntrypoint(BasePPOExp):
         await inference_engine_client.wake_up()
         generator = self.get_generator(self.cfg, self.tokenizer, inference_engine_client)
 
-        eval_fn = evaluate_step_wise if self.cfg.generator.step_wise_trajectories else evaluate
-        results: dict[str, Any] = await eval_fn(
+        results: dict[str, Any] = await evaluate(
             eval_dataloader=build_dataloader(self.cfg, self.eval_dataset, is_train=False),
             generator=generator,
             cfg=self.cfg,

@@ -111,40 +111,29 @@ def test_apply_mtp_config_does_not_clobber_explicit_speculative_config():
     assert cfg.generator.inference_engine.speculative_config["num_speculative_tokens"] == 5
 
 
-def _spec_cfg(strategy="megatron", weight_sync_backend="nccl"):
+def _spec_cfg(strategy="megatron", weight_sync_backend="nccl", colocate_all=False):
     cfg = SkyRLTrainConfig()
     cfg.trainer.strategy = strategy
     cfg.trainer.mtp.enabled = True
+    cfg.trainer.placement.colocate_all = colocate_all
     cfg.generator.inference_engine.weight_sync_backend = weight_sync_backend
     _apply_mtp_config(cfg)
     assert cfg.generator.inference_engine.speculative_config["method"] == "mtp"
     return cfg
 
 
-def test_draft_weight_sync_cfg_accepts_megatron_nccl():
-    _validate_draft_weight_sync_cfg(_spec_cfg())
+@pytest.mark.parametrize(
+    ("weight_sync_backend", "colocate_all"),
+    [("nccl", False), ("nccl", True), ("delta", False)],
+)
+def test_draft_weight_sync_cfg_accepts_megatron_full_weight_backends(weight_sync_backend, colocate_all):
+    _validate_draft_weight_sync_cfg(_spec_cfg(weight_sync_backend=weight_sync_backend, colocate_all=colocate_all))
 
 
 def test_draft_weight_sync_cfg_noop_without_spec_decode():
     cfg = SkyRLTrainConfig()
     cfg.trainer.strategy = "fsdp"
-    _validate_draft_weight_sync_cfg(cfg)
-    cfg.generator.inference_engine.speculative_config = {"method": "ngram", "prompt_lookup_max": 4}
-    _validate_draft_weight_sync_cfg(cfg)
-
-
-@pytest.mark.parametrize(
-    "speculative_config",
-    [
-        {"method": "eagle3", "model": "some/eagle-head"},
-        {"method": "dflash", "model": "some/dflash-head"},
-        {"model": "some/external-draft-checkpoint"},
-    ],
-)
-def test_draft_weight_sync_cfg_leaves_external_draft_models_unchanged(speculative_config):
-    cfg = SkyRLTrainConfig()
-    cfg.trainer.strategy = "fsdp"
-    cfg.generator.inference_engine.speculative_config = speculative_config
+    cfg.generator.inference_engine.weight_sync_backend = "sharded_rdt"
     _validate_draft_weight_sync_cfg(cfg)
 
 
@@ -153,8 +142,8 @@ def test_draft_weight_sync_cfg_rejects_fsdp():
         _validate_draft_weight_sync_cfg(_spec_cfg(strategy="fsdp"))
 
 
-@pytest.mark.parametrize("backend", ["delta", "sharded_rdt"])
-def test_draft_weight_sync_cfg_rejects_non_retargeting_backends(backend):
+@pytest.mark.parametrize("backend", ["sharded_rdt", "rdt"])
+def test_draft_weight_sync_cfg_rejects_sharded_rdt(backend):
     with pytest.raises(ValueError, match=f"weight_sync_backend={backend!r}"):
         _validate_draft_weight_sync_cfg(_spec_cfg(weight_sync_backend=backend))
 

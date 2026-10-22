@@ -56,7 +56,9 @@ def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig])
     stop_val = sampling_params.stop
     vllm_sampling_params = {
         "min_tokens": (
-            sampling_params.get("min_tokens", 1) if isinstance(sampling_params, DictConfig) else sampling_params.min_tokens
+            sampling_params.get("min_tokens", 1)
+            if isinstance(sampling_params, DictConfig)
+            else sampling_params.min_tokens
         ),
         "skip_special_tokens": True,
         "include_stop_str_in_output": True,

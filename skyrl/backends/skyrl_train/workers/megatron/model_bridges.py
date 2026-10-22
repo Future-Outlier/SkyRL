@@ -26,6 +26,10 @@ try:
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.utils import unwrap_model
 
+    # GLM-5.3-Flash (glm5_next): KDA + NoPE-MLA/DSA hybrid MoE with mHC residuals. Importing
+    # registers the bridge for ``Glm5NextForConditionalGeneration`` -> GPTModel.
+    import skyrl.backends.skyrl_train.patches.megatron.glm5_next.bridge  # noqa: F401
+
     @MegatronModelBridge.register_bridge(
         source="Glm4MoeLiteForCausalLM",
         target=GPTModel,
@@ -91,10 +95,9 @@ try:
 
     # Qwen3.5 (language-model-only) -> GPTModel.
     #
-    # Qwen3.5 checkpoints dispatch to the VL bridge -> Qwen3VLModel, which packs
-    # sequences inside its own forward and breaks under SkyRL sample packing. When
-    # only the LM is wanted (language_model_only=True), route to the native
-    # GPTModel + GDN thd path instead. The stock text bridges assume a flat text
+    # Qwen3.5 checkpoints dispatch to the VL bridge -> Qwen3VLModel, which builds
+    # the vision tower. When only the LM is wanted (language_model_only=True),
+    # route to the native GPTModel + GDN path instead. The stock text bridges assume a flat text
     # checkpoint (top-level config, hf_prefix="model."); these subclasses adapt
     # them to the unified VL checkpoint (text_config, model.language_model.*),
     # like Qwen35VLBridge but targeting GPTModel.

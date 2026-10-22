@@ -6,7 +6,9 @@ import pytest
 from omegaconf import OmegaConf
 from vllm import SamplingParams as VllmSamplingParams
 
-from skyrl.backends.skyrl_train.inference_servers.engine_utils import get_vllm_sampling_params
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
+    get_vllm_sampling_params,
+)
 from skyrl.train.config import SamplingParams
 
 

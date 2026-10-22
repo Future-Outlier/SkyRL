@@ -27,6 +27,7 @@ def test_isoexec_is_opt_in_and_preserves_default_runtime_environment():
 
 
 def test_isoexec_runtime_uses_physical_gpu_namespace():
+    pytest.importorskip("isoexec.runtimes.environment")
     cfg = example_dummy_config()
     cfg.trainer.enable_isoexec = True
 
@@ -34,6 +35,7 @@ def test_isoexec_runtime_uses_physical_gpu_namespace():
 
 
 def test_isoexec_runtime_forwards_isoexec_overrides_only_when_enabled(monkeypatch):
+    pytest.importorskip("isoexec.runtimes.environment")
     monkeypatch.setenv("ISOEXEC_FULL_DISTRIBUTION_EVIDENCE_DIR", "/evidence/rows")
     monkeypatch.setenv("ISOEXEC", "1")
     cfg = example_dummy_config()
@@ -75,7 +77,7 @@ def test_action_mode_preserves_evaluation_logprobs():
 def test_logprob_modes_must_match():
     cfg = example_dummy_config()
     cfg.trainer.rollout_logprob_comparison = "full"
-    with pytest.raises(ValueError, match="must agree"):
+    with pytest.raises(ValueError, match="must match"):
         validate_logprob_comparison(cfg)
 
 

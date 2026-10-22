@@ -70,7 +70,7 @@ def test_full_logprob_engine_defaults_reject_conflicts(engine_kwargs):
 def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8(monkeypatch):
     import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
 
-    monkeypatch.setattr(inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path: [])
+    monkeypatch.setattr(inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path, _wire_format=None: [])
     cfg = SkyRLTrainConfig()
     ie_cfg = cfg.generator.inference_engine
     ie_cfg.fp8_weight_sync_mode = "blockwise"
@@ -99,7 +99,7 @@ def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8(monke
 def test_serialized_fp8_weight_sync_rejects_conflicting_vllm_settings(engine_kwargs, monkeypatch):
     import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
 
-    monkeypatch.setattr(inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path: [])
+    monkeypatch.setattr(inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path, _wire_format=None: [])
     cfg = SkyRLTrainConfig()
     cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
 
@@ -136,6 +136,24 @@ def test_serialized_fp8_requires_model_path():
 
     with pytest.raises(ValueError, match="model path is required"):
         _apply_serialized_fp8_weight_sync_defaults(cfg.generator.inference_engine, {})
+
+
+def test_full_logprobs_require_raw_complete_rows():
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.logprob_output = "full"
+    engine_kwargs = {}
+
+    _apply_full_logprob_engine_defaults(cfg.generator.inference_engine, engine_kwargs)
+
+    assert engine_kwargs == {"max_logprobs": -1, "logprobs_mode": "raw_logprobs"}
+
+
+@pytest.mark.parametrize("engine_kwargs", [{"max_logprobs": 20}, {"logprobs_mode": "processed_logprobs"}])
+def test_full_logprobs_reject_conflicting_engine_settings(engine_kwargs):
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.logprob_output = "full"
+    with pytest.raises(ValueError, match="full logprobs"):
+        _apply_full_logprob_engine_defaults(cfg.generator.inference_engine, engine_kwargs)
 
 
 def test_serialized_fp8_fails_when_model_config_cannot_be_inspected(monkeypatch):
@@ -206,12 +224,61 @@ def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch):
     # tests/backends/skyrl_train/mtp/test_build_vllm_cli_args_mtp.py
 
 
+@pytest.mark.vllm
+def test_default_logprobs_mode_is_processed_logprobs():
+    args = build_vllm_cli_args(SkyRLTrainConfig())
+
+    assert args.logprobs_mode == "processed_logprobs"
+
+
+@pytest.mark.vllm
+def test_sample_support_uses_processed_top_k_logprobs():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "generator.inference_engine.enable_return_sample_support_set=true",
+            "generator.sampling_params.top_k=8",
+        ]
+    )
+
+    args = build_vllm_cli_args(cfg)
+
+    assert args.max_logprobs == 8
+    assert args.logprobs_mode == "processed_logprobs"
+
+
 def test_resolve_policy_model_name_uses_served_model_name():
     cfg = SkyRLTrainConfig()
     cfg.trainer.policy.model.path = "base-model"
     cfg.generator.inference_engine.served_model_name = "served-alias"
 
     assert resolve_policy_model_name(cfg) == "served-alias"
+
+
+def test_serialized_fp8_threads_the_wire_format_into_the_ignore_list(monkeypatch):
+    """The engine ignore list is wire-specific, so the resolved wire must reach the spec.
+
+    MXFP8 excludes more modules than blockwise (its kernels need a 32-aligned reduction dim
+    and out_features >= 128), and the engine builds quantized modules for everything absent
+    from this list, so a blockwise list under an MXFP8 wire builds modules the sync never
+    feeds.
+    """
+    import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
+
+    seen = []
+    monkeypatch.setattr(
+        inference_utils,
+        "_serialized_fp8_ignored_layers",
+        lambda _model_path, wire_format=None: seen.append(wire_format) or [],
+    )
+    cfg = SkyRLTrainConfig()
+    ie_cfg = cfg.generator.inference_engine
+    ie_cfg.fp8_weight_sync_mode = "mxfp8"
+    engine_kwargs = {}
+
+    _apply_serialized_fp8_weight_sync_defaults(ie_cfg, engine_kwargs, model_path="qwen35-test")
+
+    assert seen == ["mxfp8"]
+    assert engine_kwargs["quantization"] == "compressed-tensors"
 
 
 class TestGetPDP2PConnectorName:
@@ -296,6 +363,7 @@ class TestGetPDCLIArgs:
             get_pd_cli_args(args, role="decode")
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("enabled", [False, True])
 def test_native_chunked_prefill_setting_reaches_engine(monkeypatch, enabled):
     from vllm.platforms import current_platform

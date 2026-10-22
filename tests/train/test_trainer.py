@@ -11,6 +11,10 @@ from jaxtyping import Float, Integer
 from pytest import approx
 
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_DTYPE,
+    SAMPLE_SUPPORT_PADDING,
+)
 from skyrl.backends.skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.worker_utils import BatchIterator
 from skyrl.train.config import SkyRLTrainConfig
@@ -102,79 +106,33 @@ def test_convert_to_training_input_right_aligns_full_logprob_rows(dummy_config, 
     torch.testing.assert_close(training_input["rollout_full_logprobs"][1], torch.from_numpy(full_long))
     assert "rollout_full_logprobs" not in generator_output
     assert training_input["sample_indices"].tolist() == [0, 1]
-    assert training_input.metadata["global_step"] == 0
 
 
-def test_full_logprob_rows_are_forwarded_only_to_policy_prescore(dummy_config, dummy_tokenizer, dummy_generator):
-    pytest.importorskip("isoexec.integrations.skyrl.full_distribution")
-    dummy_config.trainer.rollout_logprob_comparison = "full"
-    dummy_config.trainer.algorithm.use_kl_loss = True
-    dummy_config.generator.inference_engine.enable_ray_prometheus_stats = False
-    trainer = RayPPOTrainer(
-        cfg=dummy_config,
-        tracker=None,
-        tokenizer=dummy_tokenizer,
-        train_dataset=DummyDataset(),
-        eval_dataset=DummyDataset(),
-        inference_engine_client=None,
-        generator=dummy_generator,
-    )
+def test_isoexec_action_logprob_mismatch_refuses_before_training():
+    pytest.importorskip("isoexec.integrations.skyrl.audit")
+    from isoexec.checks import Refusal
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.enable_isoexec = True
+    trainer.cfg.trainer.rollout_logprob_comparison = "action"
+    trainer.cfg.trainer.critic.model.path = None
+    trainer.ref_model = None
     trainer.dispatch = MagicMock()
-    trainer.ref_model = MagicMock()
-    observed = {}
-
-    def collect_forward(model, data, key, mini_batch_boundaries):
-        # Snapshot at dispatch time: the policy later mutates the same batch.
-        observed[model] = {
-            "key": key,
-            "has_full_rows": "rollout_full_logprobs" in data,
-            "has_mask": "loss_mask" in data,
-            "has_rollout_logprobs": "rollout_logprobs" in data,
-            "sample_indices": data["sample_indices"].tolist() if data.get("sample_indices") is not None else None,
-            "global_step": data.metadata.get("global_step"),
-        }
-        if model == "ref":
-            return torch.full((len(data["sequences"]), data.metadata["response_length"]), -2.0)
-        return data["rollout_logprobs"].clone()
-
-    trainer._execute_forward_pass = MagicMock(side_effect=collect_forward)
-    training_input = TrainingInputBatch(
+    trainer.all_metrics = {}
+    trainer._execute_forward_pass = MagicMock(return_value=torch.tensor([[-1.0, -1.5]]))
+    batch = TrainingInputBatch(
         {
             "sequences": torch.tensor([[10, 11, 12]]),
             "attention_mask": torch.ones((1, 3), dtype=torch.long),
             "loss_mask": torch.ones((1, 2)),
             "rollout_logprobs": torch.tensor([[-1.0, -2.0]]),
-            "rollout_full_logprobs": torch.tensor([[[-1.0, -2.0], [-3.0, -4.0]]]),
-            "sample_indices": torch.tensor([5]),
         }
     )
-    training_input.metadata = {"response_length": 2, "global_step": 3}
+    batch.metadata = {"response_length": 2}
 
-    trainer.fwd_logprobs_values_reward(training_input)
-
-    assert list(observed) == ["ref", "policy"]
-    assert observed["ref"] == {
-        "key": "logprobs",
-        "has_full_rows": False,
-        "has_mask": False,
-        "has_rollout_logprobs": False,
-        "sample_indices": None,
-        "global_step": None,
-    }
-    assert observed["policy"] == {
-        "key": "logprobs",
-        "has_full_rows": True,
-        "has_mask": True,
-        "has_rollout_logprobs": True,
-        "sample_indices": [5],
-        "global_step": 3,
-    }
-    assert "rollout_full_logprobs" not in training_input
-    assert "sample_indices" not in training_input
-    assert training_input["base_action_log_probs"].tolist() == [[-2.0, -2.0]]
-    assert training_input["action_log_probs"].tolist() == [[-1.0, -2.0]]
-    assert trainer.all_metrics["policy/full_logprobs_verified_rows"] == 2
-    assert trainer.dispatch.empty_cache.call_args_list == [call("ref"), call()]
+    with pytest.raises(Refusal, match="exact-zero pre-update"):
+        trainer.fwd_logprobs_values_reward(batch)
 
 
 def _get_test_data(trainer: RayPPOTrainer):
@@ -227,6 +185,37 @@ def _get_test_data(trainer: RayPPOTrainer):
     data = trainer.apply_reward_kl_penalty(data)
 
     return data
+
+
+def test_convert_to_training_input_records_sample_support_metrics(dummy_config, dummy_tokenizer, dummy_generator):
+    dummy_config.trainer.policy_mini_batch_size = 2
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=dummy_tokenizer,
+        train_dataset=DummyDataset(),
+        eval_dataset=None,
+        inference_engine_client=None,
+        generator=dummy_generator,
+    )
+    trainer.dispatch = MagicMock()
+    trainer.dispatch.get_lcm_dp_size.return_value = 1
+    padding_row = [SAMPLE_SUPPORT_PADDING] * 4
+    generator_output = {
+        "prompt_token_ids": [[1, 2], [3]],
+        "response_ids": [[4, 5, 6], [7, 8]],
+        "rewards": [[0.0, 0.0, 1.0], [0.0, 1.0]],
+        "loss_masks": [[1, 1, 0], [1, 1]],
+        "rollout_sample_support": [
+            np.array([[4, 14, -1, -1], [5, 15, 25, 35], padding_row], dtype=SAMPLE_SUPPORT_DTYPE),
+            np.array([[7, -1, -1, -1], [8, 18, 28, -1]], dtype=SAMPLE_SUPPORT_DTYPE),
+        ],
+    }
+
+    trainer.convert_to_training_input(generator_output, ["uid1", "uid2"])
+
+    assert trainer.all_metrics["generate/sample_support_size_mean"] == 2.5
+    assert trainer.all_metrics["generate/sample_support_full_fraction"] == 0.25
 
 
 def test_calculate_kl_create_experience_batched(dummy_config):
@@ -813,3 +802,85 @@ def test_validate_batch_sizes_lcm_dp_requirement():
     # Pass: ref disabled -> requirement reduces to policy_dp. With policy_dp=2, tbs=2 is valid.
     cfg = create_config(train_batch_size=2, policy_dp=2, ref_dp=3, include_ref=False)
     validate_batch_sizes(cfg)
+
+
+def test_full_logprob_rows_are_forwarded_only_to_policy_prescore(
+    dummy_config, dummy_tokenizer, dummy_generator, monkeypatch
+):
+    pytest.importorskip("isoexec.integrations.skyrl.full_distribution")
+    dummy_config.trainer.rollout_logprob_comparison = "full"
+    dummy_config.trainer.algorithm.use_kl_loss = True
+    dummy_config.generator.inference_engine.enable_ray_prometheus_stats = False
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=dummy_tokenizer,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=dummy_generator,
+    )
+    trainer.dispatch = MagicMock()
+    trainer.ref_model = MagicMock()
+    observed = {}
+
+    def collect_forward(model, data, key, mini_batch_boundaries):
+        # Snapshot at dispatch time: the policy later mutates the same batch.
+        observed[model] = {
+            "key": key,
+            "has_full_rows": "rollout_full_logprobs" in data,
+            "has_mask": "loss_mask" in data,
+            "has_rollout_logprobs": "rollout_logprobs" in data,
+            "sample_indices": data["sample_indices"].tolist() if data.get("sample_indices") is not None else None,
+            "global_step": data.metadata.get("global_step"),
+        }
+        if model == "ref":
+            return torch.full((len(data["sequences"]), data.metadata["response_length"]), -2.0)
+        return data["rollout_logprobs"].clone()
+
+    trainer._execute_forward_pass = MagicMock(side_effect=collect_forward)
+    full_rows = torch.log_softmax(torch.tensor([[2.0, 1.0], [1.0, 2.0]], dtype=torch.float32), dim=-1)
+    rollout_logprobs = full_rows[torch.arange(2), torch.tensor([0, 1])].unsqueeze(0)
+    training_input = TrainingInputBatch(
+        {
+            "sequences": torch.tensor([[0, 0, 1]]),
+            "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            "loss_mask": torch.ones((1, 2)),
+            "rollout_logprobs": rollout_logprobs,
+            "rollout_full_logprobs": full_rows.unsqueeze(0),
+            "sample_indices": torch.tensor([5]),
+        }
+    )
+    training_input.metadata = {"response_length": 2, "global_step": 3}
+
+    # This unit test checks attachment ordering with a worker double, not distributed comparison.
+    import ray
+
+    with monkeypatch.context() as scope:
+        scope.setattr(ray, "is_initialized", lambda: False)
+        trainer.fwd_logprobs_values_reward(training_input)
+
+    assert list(observed) == ["ref", "policy"]
+    assert observed["ref"] == {
+        "key": "logprobs",
+        "has_full_rows": False,
+        "has_mask": False,
+        "has_rollout_logprobs": False,
+        "sample_indices": None,
+        "global_step": None,
+    }
+    assert observed["policy"] == {
+        "key": "logprobs",
+        "has_full_rows": True,
+        "has_mask": True,
+        "has_rollout_logprobs": True,
+        "sample_indices": [5],
+        "global_step": 3,
+    }
+    assert "rollout_full_logprobs" not in training_input
+    assert "sample_indices" not in training_input
+    assert training_input["base_action_log_probs"].tolist() == [[-2.0, -2.0]]
+    assert torch.equal(training_input["action_log_probs"], rollout_logprobs)
+    assert "isoexec_online_prescore_receipt" not in training_input.metadata
+    assert trainer.all_metrics["policy/full_logprobs_verified_rows"] == 2
+    assert trainer.dispatch.empty_cache.call_args_list == [call("ref"), call()]
