@@ -229,7 +229,9 @@ def isoexec_full_distribution_command(
     python: str = "/tmp/skyrl-isoexec-env/bin/python",
 ) -> list[str]:
     """Return the bounded one-step command used by the combined local-repo smoke."""
-    engine_kwargs = '{"max_model_len":256,"max_num_seqs":4,' '"compilation_config":{"mode":0,"cudagraph_mode":"NONE"}}'
+    engine_kwargs = (
+        '{"max_model_len":256,"max_num_seqs":4,' '"compilation_config":{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}}'
+    )
     overrides = [
         "data.train_data=['/root/data/gsm8k/train.parquet']",
         "data.val_data=['/root/data/gsm8k/validation.parquet']",
@@ -291,7 +293,7 @@ def isoexec_full_distribution_command(
         "generator.inference_engine.max_num_batched_tokens=256",
         "generator.inference_engine.enable_prefix_caching=false",
         "generator.inference_engine.enable_chunked_prefill=true",
-        "generator.inference_engine.enforce_eager=true",
+        "generator.inference_engine.enforce_eager=false",
         f"generator.inference_engine.engine_init_kwargs={engine_kwargs}",
         "generator.batched=true",
         "generator.max_turns=1",
