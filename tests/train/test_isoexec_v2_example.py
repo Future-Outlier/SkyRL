@@ -30,7 +30,8 @@ def test_checkpoint_config_selects_the_shared_architecture(name, tmp_path):
         source_config,
     )
 
-    raw = json.loads(files("isoexec.models.v2." + name).joinpath("config.json").read_text())
+    config_package = MODELS[name][1] + "." + name
+    raw = json.loads(files(config_package).joinpath("config.json").read_text())
     checkpoint = tmp_path / "private checkpoint"
     checkpoint.mkdir()
     (checkpoint / "config.json").write_text(json.dumps(raw))
