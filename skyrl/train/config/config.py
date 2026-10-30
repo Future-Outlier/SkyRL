@@ -1489,12 +1489,6 @@ class GrafanaAnnotationsConfig(BaseConfig):
 
 @dataclass
 class TrainerConfig(BaseConfig):
-    enable_isoexec: bool = False
-    """Build trainer and rollout models through the installed IsoExec package.
-    IsoExec remains opt-in and must be installed in every driver, trainer, and inference-worker environment."""
-    isoexec_model: Optional[Dict[str, Any]] = None
-    """Optional JSON V2 source/configuration and separate trainer/inference placement policy.
-    Native Megatron and inference-engine parallelism fields remain authoritative."""
     isoexec_capture_max_tokens: Optional[int] = None
     """Optional bound on padded packed V2 trainer/prescore tokens. Standard batched rollouts derive it;
     custom trajectories must provide a finite bound. Actual inputs are still guarded by the captured profile."""
@@ -1912,6 +1906,13 @@ class SkyRLTrainConfig(BaseConfig):
     ``from_cli_overrides``): ``trainer.policy.model.path=...`` sets
     ``SkyRLTrainConfig.trainer.policy.model.path``.
     """
+
+    enable_isoexec: bool = False
+    """Build trainer and rollout models through the installed IsoExec package.
+    IsoExec remains opt-in and must be installed in every driver, trainer, and inference-worker environment."""
+    isoexec_model: Optional[Dict[str, Any]] = None
+    """Optional JSON V2 source/configuration and separate trainer/inference placement policy.
+    Native Megatron and inference-engine parallelism fields remain authoritative."""
 
     data: DataConfig = field(default_factory=DataConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)

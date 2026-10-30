@@ -335,7 +335,7 @@ def build_new_inference_client(
             )
         cli_args = build_vllm_cli_args(cfg)
         extra_env_vars = None
-        if cfg.trainer.enable_isoexec:
+        if cfg.enable_isoexec:
             from isoexec.integrations.skyrl.config import engine_runtime_env
 
             # vLLM discovers plugins while the inference actor imports vLLM.

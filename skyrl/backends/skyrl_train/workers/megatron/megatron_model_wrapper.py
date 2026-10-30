@@ -212,6 +212,7 @@ class MegatronModelWrapper:
         actor_optimizer: Optional[torch.optim.Optimizer] = None,
         policy_loss_fn: Optional[Callable] = None,
         is_vlm: bool = False,
+        enable_isoexec: bool = False,
     ):
         self.cfg = config
         self.actor_module = actor_module
@@ -219,6 +220,7 @@ class MegatronModelWrapper:
         self.policy_loss_fn = policy_loss_fn
         self.remove_microbatch_padding = self.cfg.remove_microbatch_padding
         self.is_vlm = is_vlm
+        self.enable_isoexec = enable_isoexec
         # Sample packing for VLMs needs a model that computes mRoPE positions from the packed
         # stream itself; other VLMs only run unpacked (see _assert_vlm_supported).
         self.model_owns_vlm_packing = is_vlm and model_owns_vlm_packing(self.actor_module)
@@ -242,7 +244,7 @@ class MegatronModelWrapper:
         # IsoExec model construction instead installs a callback that also synchronizes
         # cross-PP tied parameters. Save the selected callback before replacing it with
         # SkyRL's deferrer.
-        isoexec_enabled = getattr(self.cfg, "enable_isoexec", False) is True
+        isoexec_enabled = self.enable_isoexec
         self._finalize_model_grads = (
             config.finalize_model_grads_func
             if isoexec_enabled and config.finalize_model_grads_func is not None
@@ -370,8 +372,8 @@ class MegatronModelWrapper:
             # the chunked log-prob so this forward-only pass never materializes the
             # full [B, S, vocab//TP] logits (which would OOM at long context).
             fused_lm_head = self._fused_lm_head and data.get("lm_head_weight") is not None
-            if expected is not None and not getattr(self.cfg, "enable_isoexec", False):
-                raise ValueError("Full logprob comparison requires trainer.enable_isoexec=true")
+            if expected is not None and not self.enable_isoexec:
+                raise ValueError("Full logprob comparison requires enable_isoexec=true")
             lm_head_weight = data.get("lm_head_weight")
             if fused_lm_head:
                 _v_local = int(lm_head_weight.shape[0])

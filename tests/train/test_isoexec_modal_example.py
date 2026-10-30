@@ -23,7 +23,7 @@ def test_modal_example_enables_full_logprob_comparison(monkeypatch):
     cfg = SkyRLTrainConfig.from_cli_overrides(overrides)
     validate_logprob_comparison(cfg)
 
-    assert cfg.trainer.enable_isoexec is True
+    assert cfg.enable_isoexec is True
     assert cfg.trainer.rollout_logprob_comparison == "full"
     assert cfg.generator.inference_engine.logprob_output == "full"
     assert cfg.generator.eval_sampling_params.logprobs is None

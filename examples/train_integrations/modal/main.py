@@ -235,7 +235,7 @@ def isoexec_full_distribution_command(
     overrides = [
         "data.train_data=['/root/data/gsm8k/train.parquet']",
         "data.val_data=['/root/data/gsm8k/validation.parquet']",
-        "trainer.enable_isoexec=true",
+        "enable_isoexec=true",
         "trainer.rollout_logprob_comparison=full",
         "generator.inference_engine.logprob_output=full",
         "trainer.policy.model.path=/root/data/models/Qwen3.5-0.8B",

@@ -20,17 +20,20 @@ export PYTHONPATH="$SKYRL_ROOT:$SKYRL_ROOT/skyrl-gym:$ISOEXEC_ROOT${PYTHONPATH:+
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 export SKYRL_PYTHONPATH_EXPORT=1 SKYRL_LD_LIBRARY_PATH_EXPORT=1
 export RAY_ADDRESS="${RAY_ADDRESS:-local}"
-runner=(uv run --isolated --no-project --python "$PYTHON_EXECUTABLE")
-source_config='{"source":{"api_version":2,"package":"isoexec.models.v2.qwen3_5_0_8b"},"revision":"2fc06364715b967f1860aea9cf38778875588b17","trainer_placement":{"leaves":8,"leaf_dtype":"bf16"},"inference_placement":{"leaves":8,"leaf_dtype":"bf16"}}'
-engine_kwargs='{"compilation_config":{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"},"max_model_len":1024,"max_num_seqs":8,"prefill_context_parallel_size":1,"decode_context_parallel_size":1,"quantization":null,"speculative_config":null,"seed":42}'
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+export SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S="${SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S:-1200}"
+runner=(uv run --isolated --no-project "$PYTHON_EXECUTABLE")
+# IsoExec selects the shared architecture and reads dimensions from the HF checkpoint.
+source_config='{"source":{"api_version":2,"package":"isoexec.models.v2.qwen3_5"},"revision":"2fc06364715b967f1860aea9cf38778875588b17","trainer_placement":{"leaves":8,"leaf_dtype":"bf16"},"inference_placement":{"leaves":8,"leaf_dtype":"bf16"}}'
+engine_kwargs='{"compilation_config":{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"},"max_model_len":2048,"max_num_seqs":8,"prefill_context_parallel_size":1,"decode_context_parallel_size":1,"quantization":null,"speculative_config":null,"seed":42}'
 
 command=(-m skyrl.train.entrypoints.main_base
   "data.train_data=[\"$DATA_DIR/train.parquet\"]"
   "data.val_data=[\"$DATA_DIR/validation.parquet\"]"
-  trainer.enable_isoexec=true
+  enable_isoexec=true
   trainer.rollout_logprob_comparison=full
   generator.inference_engine.logprob_output=full
-  "trainer.isoexec_model=$source_config"
+  "isoexec_model=$source_config"
   trainer.strategy=megatron trainer.bf16=true
   trainer.policy.model.path=Qwen/Qwen3.5-0.8B
   trainer.policy.model.lora.rank=0
@@ -93,7 +96,8 @@ command=(-m skyrl.train.entrypoints.main_base
   generator.batched=true generator.n_samples_per_prompt=2
   generator.sampling_params.temperature=1.0
   generator.sampling_params.top_p=1.0
-  generator.sampling_params.max_generate_length=512
+  generator.sampling_params.max_generate_length=1024
+  generator.eval_sampling_params.max_generate_length=1024
   generator.sampling_params.logprobs=1
   environment.env_class=gsm8k
 )

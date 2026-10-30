@@ -272,6 +272,7 @@ class SkyRLTrainBackend(AbstractBackend):
 
     def _build_policy(self, PolicyWorker, model_id: str):
         cfg = self._cfg
+        assert cfg is not None
         colocate_all = cfg.trainer.placement.colocate_all
         pg = self._colocate_pg
         is_lora = cfg.trainer.policy.model.lora.rank > 0
@@ -294,6 +295,8 @@ class SkyRLTrainBackend(AbstractBackend):
             cfg.trainer.placement.policy_num_nodes,
             cfg.trainer.placement.policy_num_gpus_per_node,
             PolicyWorker,
+            enable_isoexec=cfg.enable_isoexec,
+            isoexec_model=cfg.isoexec_model,
             pg=pg,
             num_gpus_per_actor=0.2 if colocate_all else 1,
             colocate_all=colocate_all,
@@ -340,6 +343,7 @@ class SkyRLTrainBackend(AbstractBackend):
 
     def _build_critic(self, CriticWorker, lora_config: types.LoraConfig) -> None:
         cfg = self._cfg
+        assert cfg is not None
         colocate_all = cfg.trainer.placement.colocate_all
         if colocate_all:
             num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
@@ -355,6 +359,8 @@ class SkyRLTrainBackend(AbstractBackend):
             cfg.trainer.placement.critic_num_nodes,
             cfg.trainer.placement.critic_num_gpus_per_node,
             CriticWorker,
+            enable_isoexec=cfg.enable_isoexec,
+            isoexec_model=cfg.isoexec_model,
             pg=self._colocate_pg,
             num_gpus_per_actor=0.2 if colocate_all else 1,
             colocate_all=colocate_all,

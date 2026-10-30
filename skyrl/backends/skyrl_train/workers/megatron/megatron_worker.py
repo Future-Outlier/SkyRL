@@ -855,7 +855,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             seed=self.cfg.seed,
             is_lora=self._is_lora,
             node_local_rank=self._local_rank,
-            enable_isoexec=self.cfg.enable_isoexec,
+            enable_isoexec=self.enable_isoexec,
         )
         self.strategy.setup_distributed()
 
@@ -873,7 +873,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
-        if self.cfg.enable_isoexec:
+        if self.enable_isoexec:
             from isoexec.integrations.skyrl.megatron import init_model
 
             return init_model(self, model_path, num_training_steps, section="policy")
@@ -973,6 +973,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # create worker model
         self.model = MegatronModelWrapper(
             config=self.cfg,
+            enable_isoexec=self.enable_isoexec,
             actor_module=self.actor_module,
             actor_optimizer=self.optimizer,
             policy_loss_fn=self.policy_loss_fn,
@@ -1337,7 +1338,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # spans more than one call.
         self.model.run_pending_grad_sync()
 
-        if self.cfg.enable_isoexec:
+        if self.enable_isoexec:
             from isoexec.integrations.skyrl.megatron import optimizer_step
 
             grad_norm = optimizer_step(self)
@@ -1421,9 +1422,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
     def _build_weight_source(self, dtype: "torch.dtype", backend: str):
         """Build this rank's ``WeightSource`` for the selected trainer backend."""
-        if self.cfg.enable_isoexec:
+        if self.enable_isoexec:
             if backend not in {"nccl", "ipc"}:
-                raise ValueError(f"trainer.enable_isoexec supports nccl or ipc weight sync, got {backend!r}")
+                raise ValueError(f"enable_isoexec supports nccl or ipc weight sync, got {backend!r}")
             from isoexec.integrations.skyrl.weight_source import IsoExecWeightSource
 
             return IsoExecWeightSource(self.actor_module, dtype)
@@ -1929,7 +1930,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             optimizer_config=None,
             seed=self.cfg.seed,
             node_local_rank=self._local_rank,
-            enable_isoexec=self.cfg.enable_isoexec,
+            enable_isoexec=self.enable_isoexec,
         )
         self.strategy.setup_distributed()
 
@@ -1947,7 +1948,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         """
         Initialize the model for the ref worker.
         """
-        if self.cfg.enable_isoexec:
+        if self.enable_isoexec:
             from isoexec.integrations.skyrl.megatron import init_model
 
             return init_model(self, model_path, num_training_steps, section="ref")
@@ -1990,7 +1991,9 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         # create worker model
         # Propagate is_vlm so ref forwards apply the same VLM image handling and
         # parallelism guards as the policy worker.
-        self.model = MegatronModelWrapper(config=self.cfg, actor_module=self.actor_module, is_vlm=self.is_vlm)
+        self.model = MegatronModelWrapper(
+            config=self.cfg, actor_module=self.actor_module, is_vlm=self.is_vlm, enable_isoexec=self.enable_isoexec
+        )
 
         self._set_expandable_segments(True)
 

@@ -11,7 +11,7 @@ from tests.train.util import example_dummy_config
 def _full_mode_config():
     cfg = example_dummy_config()
     cfg.trainer.strategy = "megatron"
-    cfg.trainer.enable_isoexec = True
+    cfg.enable_isoexec = True
     cfg.trainer.rollout_logprob_comparison = "full"
     cfg.trainer.remove_microbatch_padding = True
     cfg.generator.inference_engine.logprob_output = "full"
@@ -22,14 +22,14 @@ def _full_mode_config():
 def test_isoexec_is_opt_in_and_preserves_default_runtime_environment():
     cfg = example_dummy_config()
 
-    assert cfg.trainer.enable_isoexec is False
+    assert cfg.enable_isoexec is False
     assert "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES" not in prepare_runtime_environment(cfg)
 
 
 def test_isoexec_runtime_uses_physical_gpu_namespace():
     pytest.importorskip("isoexec.runtimes.environment")
     cfg = example_dummy_config()
-    cfg.trainer.enable_isoexec = True
+    cfg.enable_isoexec = True
 
     assert prepare_runtime_environment(cfg)["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "1"
 
@@ -42,7 +42,7 @@ def test_isoexec_runtime_forwards_isoexec_overrides_only_when_enabled(monkeypatc
 
     assert "ISOEXEC_FULL_DISTRIBUTION_EVIDENCE_DIR" not in prepare_runtime_environment(cfg)
 
-    cfg.trainer.enable_isoexec = True
+    cfg.enable_isoexec = True
     env_vars = prepare_runtime_environment(cfg)
 
     assert env_vars["ISOEXEC_FULL_DISTRIBUTION_EVIDENCE_DIR"] == "/evidence/rows"
@@ -52,14 +52,14 @@ def test_isoexec_runtime_forwards_isoexec_overrides_only_when_enabled(monkeypatc
 def test_full_mode_fields_are_cli_overridable():
     cfg = SkyRLTrainConfig.from_cli_overrides(
         [
-            "trainer.enable_isoexec=true",
+            "enable_isoexec=true",
             "trainer.rollout_logprob_comparison=full",
             "trainer.remove_microbatch_padding=true",
             "generator.inference_engine.logprob_output=full",
         ]
     )
 
-    assert cfg.trainer.enable_isoexec is True
+    assert cfg.enable_isoexec is True
     assert cfg.trainer.rollout_logprob_comparison == "full"
     assert cfg.trainer.remove_microbatch_padding is True
     assert cfg.generator.inference_engine.logprob_output == "full"
@@ -102,8 +102,8 @@ def test_action_mode_does_not_import_isoexec(monkeypatch):
 def test_full_mode_requires_opt_in_before_importing_the_package(monkeypatch):
     _forbid_isoexec_import(monkeypatch)
     cfg = _full_mode_config()
-    cfg.trainer.enable_isoexec = False
-    with pytest.raises(ValueError, match="trainer.enable_isoexec=true"):
+    cfg.enable_isoexec = False
+    with pytest.raises(ValueError, match="enable_isoexec=true"):
         validate_logprob_comparison(cfg)
 
 

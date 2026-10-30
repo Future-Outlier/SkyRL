@@ -123,7 +123,7 @@ class RayPPOTrainer:
         callbacks: Optional[List[TrainingCallback]] = None,
     ):
         self.cfg = cfg
-        if cfg.trainer.enable_isoexec:
+        if cfg.enable_isoexec:
             from isoexec.integrations.skyrl.config import resolve
 
             resolve(cfg)
@@ -715,6 +715,8 @@ class RayPPOTrainer:
                 cfg.trainer.placement.policy_num_nodes,
                 cfg.trainer.placement.policy_num_gpus_per_node,
                 PolicyWorker,
+                enable_isoexec=cfg.enable_isoexec,
+                isoexec_model=cfg.isoexec_model,
                 pg=pg,
                 num_gpus_per_actor=0.2 if pg else 1,
                 colocate_all=True,
@@ -730,6 +732,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.ref_num_nodes,
                     cfg.trainer.placement.ref_num_gpus_per_node,
                     RefWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     pg=pg,
                     num_gpus_per_actor=0.2 if pg else 1,
                     colocate_all=True,
@@ -747,6 +751,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.critic_num_nodes,
                     cfg.trainer.placement.critic_num_gpus_per_node,
                     CriticWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     pg=pg,
                     num_gpus_per_actor=0.2,
                     colocate_all=True,
@@ -778,6 +784,8 @@ class RayPPOTrainer:
                 cfg.trainer.placement.policy_num_nodes,
                 cfg.trainer.placement.policy_num_gpus_per_node,
                 PolicyWorker,
+                enable_isoexec=cfg.enable_isoexec,
+                isoexec_model=cfg.isoexec_model,
                 pg=pg,
                 num_gpus_per_actor=0.75 if pg else 1,
                 colocate_all=False,
@@ -789,6 +797,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.ref_num_nodes,
                     cfg.trainer.placement.ref_num_gpus_per_node,
                     RefWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     pg=pg,
                     num_gpus_per_actor=0.25 if pg else 1,
                     colocate_all=False,
@@ -809,6 +819,8 @@ class RayPPOTrainer:
                     cfg.trainer.placement.critic_num_nodes,
                     cfg.trainer.placement.critic_num_gpus_per_node,
                     CriticWorker,
+                    enable_isoexec=cfg.enable_isoexec,
+                    isoexec_model=cfg.isoexec_model,
                     num_gpus_per_actor=1,
                     colocate_all=False,
                     sequence_parallel_size=cfg.trainer.critic.sequence_parallel_size,
@@ -1367,7 +1379,7 @@ class RayPPOTrainer:
         is anchor-aware here rather than a static membership in LOSSES_WITHOUT_OLD_LOGPROBS, which is
         keyed by policy_loss_type and cannot distinguish the two CISPO anchors.
         """
-        if getattr(self.cfg.trainer, "enable_isoexec", False):
+        if self.cfg.enable_isoexec:
             return False
         if getattr(self.cfg.trainer, "rollout_logprob_comparison", "action") == "full":
             return False
@@ -1458,7 +1470,7 @@ class RayPPOTrainer:
                 mini_batch_boundaries=training_input.metadata.get("policy_mini_batch_boundaries"),
             )
 
-        if self.cfg.trainer.enable_isoexec:
+        if self.cfg.enable_isoexec:
             from isoexec.integrations.skyrl.audit import require_comparison
 
             require_comparison(training_input, action_log_probs)
@@ -1493,7 +1505,7 @@ class RayPPOTrainer:
                 - action_log_probs[training_input["loss_mask"] > 0]
             ).abs()
 
-            if self.cfg.trainer.enable_isoexec:
+            if self.cfg.enable_isoexec:
                 from isoexec.integrations.skyrl.audit import check_training_batch
 
                 check_training_batch(training_input, action_log_probs, logprobs_diff)
