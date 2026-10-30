@@ -38,8 +38,10 @@ def training_overrides(
 ) -> list[str]:
     """Keep model geometry in the selected checkpoint's HF config.json."""
     hf_repo, package, default_revision = MODELS[model]
+    # IsoExec Model V2: import the shared architecture; read dimensions from HF config.json.
     source: dict[str, object] = {
         "source": {"api_version": 2, "package": package},
+        # IsoExec placement policy for trainer and inference parameters.
         "trainer_placement": {"leaves": 8, "leaf_dtype": "bf16"},
         "inference_placement": {"leaves": 8, "leaf_dtype": "bf16"},
     }
@@ -49,6 +51,7 @@ def training_overrides(
     values: dict[str, object] = {
         "data.train_data": [str(data_dir / "train.parquet")],
         "data.val_data": [str(data_dir / "validation.parquet")],
+        # IsoExec opt-in and the worker-serializable ModelSource descriptor.
         "trainer.enable_isoexec": True,
         "trainer.isoexec_model": source,
         "trainer.strategy": "megatron",
@@ -61,6 +64,7 @@ def training_overrides(
         "trainer.gradient_checkpointing": True,
         "trainer.mtp.enabled": False,
         "trainer.fused_lm_head_logprob": False,
+        # IsoExec compares every vocabulary entry at rollout/prescore token positions.
         "trainer.rollout_logprob_comparison": "full",
         "trainer.recompute_old_logprobs_per_minibatch": True,
         "trainer.placement.colocate_all": True,
@@ -131,6 +135,7 @@ def training_overrides(
         "generator.inference_engine.data_parallel_size": 1,
         "generator.inference_engine.expert_parallel_size": 1,
         "generator.inference_engine.weight_sync_backend": "nccl",
+        # Must match trainer.rollout_logprob_comparison for IsoExec full-row comparison.
         "generator.inference_engine.logprob_output": "full",
         "generator.inference_engine.enable_prefix_caching": False,
         "generator.inference_engine.enforce_eager": False,
@@ -139,6 +144,7 @@ def training_overrides(
         "generator.inference_engine.engine_init_kwargs": {
             "max_model_len": 2048,
             "max_num_seqs": 20,
+            # IsoExec keeps its OP bindings; capture decode without torch.compile.
             "compilation_config": {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"},
         },
         "environment.env_class": "gsm8k",
