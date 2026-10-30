@@ -171,10 +171,18 @@ def main() -> None:
     command += extra
     # IsoExec's prepared native SDK must also be used by Ray workers.
     os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+    # IsoExec's first native kernel builds can exceed SkyRL's default startup window.
+    os.environ.setdefault("SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S", "1200")
     if args.dry_run:
         print(
             shlex.join(
-                ["env", "RAY_ENABLE_UV_RUN_RUNTIME_ENV=" + os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"], *command]
+                [
+                    "env",
+                    "RAY_ENABLE_UV_RUN_RUNTIME_ENV=" + os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"],
+                    "SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S="
+                    + os.environ["SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S"],
+                    *command,
+                ]
             )
         )
         return

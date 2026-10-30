@@ -58,6 +58,8 @@ The default is one optimizer update with full FP32 vocabulary logprob comparison
 and decode CUDA Graphs. GSM8K limits are prompt 512, generation 1024 and model
 length 2048. Model V2 is selected with `isoexec_model.source.api_version=2`;
 it does not select vLLM Model Runner V2.
+The launcher allows 1200 seconds for server startup so first-time native kernel
+builds can finish before SkyRL's health check expires.
 
 | `--model` | Checkpoint | Shared model package |
 |---|---|---|

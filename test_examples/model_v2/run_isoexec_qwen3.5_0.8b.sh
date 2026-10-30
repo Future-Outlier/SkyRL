@@ -21,6 +21,7 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 export SKYRL_PYTHONPATH_EXPORT=1 SKYRL_LD_LIBRARY_PATH_EXPORT=1
 export RAY_ADDRESS="${RAY_ADDRESS:-local}"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+export SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S="${SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S:-1200}"
 runner=(uv run --isolated --no-project "$PYTHON_EXECUTABLE")
 # IsoExec selects the shared architecture and reads dimensions from the HF checkpoint.
 source_config='{"source":{"api_version":2,"package":"isoexec.models.v2.qwen3_5"},"revision":"2fc06364715b967f1860aea9cf38778875588b17","trainer_placement":{"leaves":8,"leaf_dtype":"bf16"},"inference_placement":{"leaves":8,"leaf_dtype":"bf16"}}'

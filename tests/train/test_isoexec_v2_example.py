@@ -66,9 +66,13 @@ def test_dry_run_keeps_paths_and_native_overrides_without_starting_training(tmp_
         text=True,
     )
     command = shlex.split(result.stdout)
-    assert command[:2] == ["env", "RAY_ENABLE_UV_RUN_RUNTIME_ENV=0"]
-    assert command[2:5] == [sys.executable, "-m", "skyrl.train.entrypoints.main_base"]
-    cfg = SkyRLTrainConfig.from_cli_overrides(command[5:])
+    assert command[:3] == [
+        "env",
+        "RAY_ENABLE_UV_RUN_RUNTIME_ENV=0",
+        "SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S=1200",
+    ]
+    assert command[3:6] == [sys.executable, "-m", "skyrl.train.entrypoints.main_base"]
+    cfg = SkyRLTrainConfig.from_cli_overrides(command[6:])
     assert cfg.data.train_data == [str(data / "train.parquet")]
     assert cfg.trainer.max_training_steps == 2
     assert cfg.isoexec_model is not None
