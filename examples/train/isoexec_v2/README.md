@@ -65,7 +65,7 @@ builds can finish before SkyRL's health check expires.
 |---|---|---|
 | `qwen3_5_0_8b` | `Qwen/Qwen3.5-0.8B` | `isoexec.models.v2.qwen3_5` |
 | `qwen3_5_9b` | `Qwen/Qwen3.5-9B` | `isoexec.models.v2.qwen3_5` |
-| `qwen1_5_moe_a2_7b` | `Qwen/Qwen1.5-MoE-A2.7B-Chat` | `isoexec.models.v2.qwen2_moe` |
+| `qwen1_5_moe_a2_7b` | `Qwen/Qwen1.5-MoE-A2.7B` | `isoexec.models.v2.qwen2_moe` |
 
 Built-in Hub IDs use pinned revisions. The driver reads that snapshot's HF
 `config.json` and safetensors and sends the resolved configuration to workers.

@@ -20,7 +20,7 @@ MODELS = {
         "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
     ),
     "qwen1_5_moe_a2_7b": (
-        "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+        "Qwen/Qwen1.5-MoE-A2.7B",
         "isoexec.models.v2.qwen2_moe",
         "1a758c50ecb6350748b9ce0a99d2352fd9fc11c9",
     ),
