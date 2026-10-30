@@ -114,7 +114,7 @@ def test_isoexec_action_logprob_mismatch_refuses_before_training():
 
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
     trainer.cfg = SkyRLTrainConfig()
-    trainer.cfg.trainer.enable_isoexec = True
+    trainer.cfg.enable_isoexec = True
     trainer.cfg.trainer.rollout_logprob_comparison = "action"
     trainer.cfg.trainer.critic.model.path = None
     trainer.ref_model = None

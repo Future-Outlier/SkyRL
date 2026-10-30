@@ -37,7 +37,7 @@ def test_isoexec_engine_args_are_strictly_opt_in(monkeypatch):
     _apply_isoexec_engine_args(cfg, args)
     assert calls == []
 
-    cfg.trainer.enable_isoexec = True
+    cfg.enable_isoexec = True
     _apply_isoexec_engine_args(cfg, args)
     assert calls == [(cfg, args)]
 

@@ -159,7 +159,7 @@ def _apply_full_logprob_engine_defaults(
 
 def _apply_isoexec_engine_args(cfg: SkyRLTrainConfig, args: Namespace) -> None:
     """Apply the installed IsoExec engine contract only for the opt-in path."""
-    if not cfg.trainer.enable_isoexec:
+    if not cfg.enable_isoexec:
         return
     from isoexec.integrations.skyrl.config import (
         engine_args as apply_isoexec_engine_args,
@@ -220,7 +220,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     args: Namespace = parser.parse_args(args=[])
 
     ie_cfg = cfg.generator.inference_engine
-    logprobs_mode = "raw_logprobs" if cfg.trainer.enable_isoexec else VLLM_LOGPROBS_MODE
+    logprobs_mode = "raw_logprobs" if cfg.enable_isoexec else VLLM_LOGPROBS_MODE
     overrides = dict(
         model=cfg.trainer.policy.model.path,
         tensor_parallel_size=ie_cfg.tensor_parallel_size,

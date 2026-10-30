@@ -52,8 +52,8 @@ def training_overrides(
         "data.train_data": [str(data_dir / "train.parquet")],
         "data.val_data": [str(data_dir / "validation.parquet")],
         # IsoExec opt-in and the worker-serializable ModelSource descriptor.
-        "trainer.enable_isoexec": True,
-        "trainer.isoexec_model": source,
+        "enable_isoexec": True,
+        "isoexec_model": source,
         "trainer.strategy": "megatron",
         "trainer.policy.model.path": checkpoint or hf_repo,
         "trainer.policy.language_model_only": True,
@@ -169,8 +169,14 @@ def main() -> None:
         args.model, args.data_dir, args.run_dir, checkpoint=args.checkpoint, revision=args.revision, steps=args.steps
     )
     command += extra
+    # IsoExec's prepared native SDK must also be used by Ray workers.
+    os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
     if args.dry_run:
-        print(shlex.join(command))
+        print(
+            shlex.join(
+                ["env", "RAY_ENABLE_UV_RUN_RUNTIME_ENV=" + os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"], *command]
+            )
+        )
         return
     os.execv(sys.executable, command)
 

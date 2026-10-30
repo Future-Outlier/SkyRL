@@ -40,8 +40,8 @@ def test_checkpoint_config_selects_the_shared_architecture(name, tmp_path):
         training_overrides(name, tmp_path / "data", tmp_path / "run", checkpoint=str(checkpoint))
     )
     validate_full_distribution_config(cfg)
-    prepare_checkpoints(cfg.trainer)
-    selected = source_config(cfg.trainer, str(checkpoint))
+    prepare_checkpoints(cfg)
+    selected = source_config(cfg.isoexec_model, cfg.trainer, str(checkpoint))
     assert selected is not None
     source, effective = selected
     assert effective == raw
@@ -66,11 +66,12 @@ def test_dry_run_keeps_paths_and_native_overrides_without_starting_training(tmp_
         text=True,
     )
     command = shlex.split(result.stdout)
-    assert command[:3] == [sys.executable, "-m", "skyrl.train.entrypoints.main_base"]
-    cfg = SkyRLTrainConfig.from_cli_overrides(command[3:])
+    assert command[:2] == ["env", "RAY_ENABLE_UV_RUN_RUNTIME_ENV=0"]
+    assert command[2:5] == [sys.executable, "-m", "skyrl.train.entrypoints.main_base"]
+    cfg = SkyRLTrainConfig.from_cli_overrides(command[5:])
     assert cfg.data.train_data == [str(data / "train.parquet")]
     assert cfg.trainer.max_training_steps == 2
-    assert cfg.trainer.isoexec_model is not None
-    assert cfg.trainer.isoexec_model["revision"] == MODELS["qwen3_5_0_8b"][2]
-    assert cfg.trainer.isoexec_model["source"]["package"] == "isoexec.models.v2.qwen3_5"
+    assert cfg.isoexec_model is not None
+    assert cfg.isoexec_model["revision"] == MODELS["qwen3_5_0_8b"][2]
+    assert cfg.isoexec_model["source"]["package"] == "isoexec.models.v2.qwen3_5"
     assert not any("model_factory" in argument for argument in command)

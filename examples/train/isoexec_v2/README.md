@@ -12,7 +12,7 @@ offload is enabled. This branch is based on SkyRL's IsoExec integration branch.
 
 ```bash
 git clone --branch codex/isoexec-v2-examples https://github.com/Future-Outlier/SkyRL.git
-git clone --branch codex/v2-hf-config https://github.com/Future-Outlier/IsoExec.git
+git clone --branch codex/skyrl-root-config https://github.com/Future-Outlier/IsoExec.git
 git clone https://github.com/fla-org/flash-linear-attention.git
 git -C flash-linear-attention checkout ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0
 cd SkyRL
@@ -36,6 +36,17 @@ current bootstrap defaults to 4.7.1, which is not admitted for these models'
 RMSNorm binding. This example uses the current project vLLM 0.30.0 and
 Transformers 5.16.1. Do not install the old vLLM 0.28.0 qualification SDK.
 
+## Shared IsoExec settings
+
+```yaml
+# IsoExec settings shared by Megatron training and vLLM inference.
+enable_isoexec: true
+isoexec_model:
+  source:
+    api_version: 2
+    package: isoexec.models.v2.qwen3_5
+```
+
 ## Run
 
 ```bash
@@ -45,7 +56,7 @@ uv run --isolated --no-project "$ISOEXEC_ENV/envs/core/bin/python" \
 
 The default is one optimizer update with full FP32 vocabulary logprob comparison
 and decode CUDA Graphs. GSM8K limits are prompt 512, generation 1024 and model
-length 2048. Model V2 is selected with `trainer.isoexec_model.source.api_version=2`;
+length 2048. Model V2 is selected with `isoexec_model.source.api_version=2`;
 it does not select vLLM Model Runner V2.
 
 | `--model` | Checkpoint | Shared model package |

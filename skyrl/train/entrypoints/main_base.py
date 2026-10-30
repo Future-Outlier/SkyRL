@@ -66,7 +66,7 @@ class BasePPOExp:
         self.cfg = cfg
         tokenizer_options = {}
         tokenizer_path = cfg.trainer.policy.model.path
-        if cfg.trainer.enable_isoexec:
+        if cfg.enable_isoexec:
             from isoexec.integrations.skyrl.config import resolve
 
             resolved = resolve(cfg)
