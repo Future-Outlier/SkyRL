@@ -63,6 +63,7 @@ def create_inference_servers(
     cli_args: Namespace,
     log_path: str,
     placement_group=None,
+    extra_env_vars: Optional[dict[str, str]] = None,
 ) -> InferenceServerSetup:
     """Build server groups and router from config.
 
@@ -133,6 +134,7 @@ def create_inference_servers(
                 distributed_executor_backend=ie_cfg.distributed_executor_backend,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(num_prefill)
         ]
@@ -156,6 +158,7 @@ def create_inference_servers(
                 distributed_executor_backend=ie_cfg.distributed_executor_backend,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(num_decode)
         ]
@@ -233,6 +236,7 @@ def create_inference_servers(
                 placement_group_bundle_offset=i * gpus_per_server * ie_cfg.data_parallel_size,
                 enable_ray_prometheus_stats=ie_cfg.enable_ray_prometheus_stats,
                 use_expandable_segments=ie_cfg.use_expandable_segments,
+                extra_env_vars=extra_env_vars,
             )
             for i in range(ie_cfg.num_engines)
         ]
@@ -323,11 +327,21 @@ def build_new_inference_client(
                 "external_proxy_url or external_server_urls."
             )
         cli_args = build_vllm_cli_args(cfg)
+        extra_env_vars = None
+        if cfg.enable_isoexec:
+            from isoexec.integrations.skyrl.config import engine_runtime_env
+
+            # vLLM discovers plugins while the inference actor imports vLLM.
+            # Registering the model in this driver process cannot update the
+            # separate actor's ModelRegistry, so pass the plugin opt-in through
+            # Ray's actor runtime_env before that import happens.
+            extra_env_vars = engine_runtime_env(cli_args)
         server_setup = create_inference_servers(
             ie_cfg,
             cli_args,
             log_path=cfg.trainer.log_path,
             placement_group=placement_group,
+            extra_env_vars=extra_env_vars,
         )
 
     client = RemoteInferenceClient(
@@ -336,6 +350,7 @@ def build_new_inference_client(
         model_name=ie_cfg.served_model_name or cfg.trainer.policy.model.path,
         enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
         enable_return_sample_support_set=ie_cfg.enable_return_sample_support_set,
+        logprob_output=ie_cfg.logprob_output,
         uses_lora_weight_sync=_uses_lora_weight_sync(cfg),
         data_parallel_size=ie_cfg.data_parallel_size,
         tokenizer=tokenizer,

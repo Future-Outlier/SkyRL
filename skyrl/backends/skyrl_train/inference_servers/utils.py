@@ -36,6 +36,7 @@ from skyrl.train.config import (
 )
 
 logger = logging.getLogger(__name__)
+VLLM_LOGPROBS_MODE = "processed_logprobs"
 
 
 def _serialized_fp8_ignored_layers(model_path: Optional[str], wire_format: str = BLOCKWISE_FP8) -> list[str]:
@@ -120,6 +121,14 @@ def _apply_serialized_fp8_weight_sync_defaults(
     engine_kwargs["hf_overrides"] = hf_overrides
 
 
+def _apply_full_logprob_engine_defaults(engine_kwargs: Dict[str, Any]) -> None:
+    """Request complete raw rows; IsoExec validates and compares their float32 bytes."""
+    for key, value in {"max_logprobs": -1, "logprobs_mode": "raw_logprobs"}.items():
+        if key in engine_kwargs and engine_kwargs[key] != value:
+            raise ValueError(f"engine_init_kwargs.{key} must be {value!r} for full logprobs")
+        engine_kwargs[key] = value
+
+
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
     """Return True when the trainer syncs LoRA adapters (not merged weights).
 
@@ -155,6 +164,15 @@ def resolve_policy_model_name(cfg: SkyRLTrainConfig) -> str:
     return cfg.generator.inference_engine.served_model_name or cfg.trainer.policy.model.path
 
 
+def _apply_isoexec_engine_args(cfg: SkyRLTrainConfig, args: Namespace) -> None:
+    """Let the opt-in integration update SkyRL's already-resolved vLLM arguments."""
+    if not cfg.enable_isoexec:
+        return
+    from isoexec.integrations.skyrl.config import engine_args
+
+    engine_args(cfg, args)
+
+
 # TODO: Add a test for validation
 def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     """Build CLI args for vLLM server from config."""
@@ -186,6 +204,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     args: Namespace = parser.parse_args(args=[])
 
     ie_cfg = cfg.generator.inference_engine
+    logprobs_mode = "raw_logprobs" if cfg.enable_isoexec else VLLM_LOGPROBS_MODE
     overrides = dict(
         model=cfg.trainer.policy.model.path,
         tensor_parallel_size=ie_cfg.tensor_parallel_size,
@@ -221,6 +240,9 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         # models with custom modeling code (MiMo, Qwen3.5, DeepSeek-V3, ...) require it to load.
         # Overridable via generator.inference_engine.engine_init_kwargs.trust_remote_code below.
         trust_remote_code=True,
+        # Normal SkyRL uses the sampling distribution. IsoExec compares the raw
+        # model distribution and applies temperature through its own implementation.
+        logprobs_mode=logprobs_mode,
     )
     # Sample-support capture asks for one logprob per top-k candidate, post-filter, so the
     # -inf entries that mark filtered candidates survive to the capture path.
@@ -280,6 +302,8 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         logger.info(f"vLLM speculative decoding enabled: speculative_config={spec_cfg}")
 
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
+    if ie_cfg.logprob_output == "full":
+        _apply_full_logprob_engine_defaults(engine_kwargs)
     _apply_serialized_fp8_weight_sync_defaults(
         ie_cfg,
         engine_kwargs,
@@ -287,6 +311,8 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     )
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
+
+    _apply_isoexec_engine_args(cfg, args)
 
     return args
 
