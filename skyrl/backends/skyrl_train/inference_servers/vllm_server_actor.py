@@ -723,6 +723,12 @@ async def _build_and_serve_vllm_server(
 
     # SkyRL uses the scale-out token-in/token-out endpoint for generation.
     cli_args.enable_scale_out = True
+    # Pass-through engine kwargs bypass vLLM's CLI parser. The profile router
+    # reads this field before AsyncEngineArgs can normalize it.
+    if isinstance(getattr(cli_args, "profiler_config", None), dict):
+        from vllm.config import ProfilerConfig
+
+        cli_args.profiler_config = ProfilerConfig(**cli_args.profiler_config)
     app = build_app(cli_args)
 
     # Initialize the engine (this loads the model - takes time)
