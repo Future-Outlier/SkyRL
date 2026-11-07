@@ -1517,8 +1517,8 @@ class InferenceEngineConfig(BaseConfig):
     engine_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine.
     Names must match the engine's args. Applied last, so they silently override config-derived
-    engine args (e.g. ``tensor_parallel_size``). The exception is ``logprobs_mode``, which is
-    always ``"processed_logprobs"``; any other value is rejected.
+    engine args (e.g. ``tensor_parallel_size``). ``logprobs_mode`` must be
+    ``"processed_logprobs"`` normally, or ``"raw_logprobs"`` with the IsoExec opt-in.
 
     For HuggingFace config overrides such as RoPE scaling, use
     ``engine_init_kwargs.hf_overrides.rope_parameters`` and set the matching trainer-side override
@@ -2148,6 +2148,11 @@ class SkyRLTrainConfig(BaseConfig):
     ``from_cli_overrides``): ``trainer.policy.model.path=...`` sets
     ``SkyRLTrainConfig.trainer.policy.model.path``.
     """
+
+    isoexec: Optional[Dict[str, Any]] = None
+    """Enable IsoExec with package-owned model and comparison options; None disables it.
+    IsoExec must be installed in every driver, trainer, and inference-worker environment.
+    Native Megatron and inference-engine parallelism fields remain authoritative."""
 
     data: DataConfig = field(default_factory=DataConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)

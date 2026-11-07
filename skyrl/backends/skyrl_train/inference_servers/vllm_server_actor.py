@@ -602,6 +602,13 @@ class VLLMServerActor(ServerActorProtocol):
                     status_code=400,
                     detail="return_sample_support_logprobs requires return_sample_support",
                 )
+            return_full_logprobs = body.get("return_full_logprobs", False)
+            if not isinstance(return_full_logprobs, bool):
+                raise HTTPException(status_code=400, detail="return_full_logprobs must be a boolean")
+            if return_full_logprobs:
+                from isoexec.integrations.skyrl.inference import validate_request
+
+                return_full_logprobs = validate_request(body, sampling_params_dict, engine.model_config, lora_request)
             if capture_sample_support:
                 # Sample support requires a bounded, non-degenerate top-k set.
                 top_k = sampling_params_dict.get("top_k")
@@ -642,6 +649,11 @@ class VLLMServerActor(ServerActorProtocol):
 
             if final_res is None:
                 raise HTTPException(status_code=500, detail="vLLM returned no output")
+            full_payload = None
+            if return_full_logprobs:
+                from isoexec.integrations.skyrl.inference import response_payload
+
+                full_payload = response_payload(final_res, engine.model_config.get_vocab_size())
             resp = final_res.outputs[0]
 
             token_ids_out = list(resp.token_ids)
@@ -685,6 +697,8 @@ class VLLMServerActor(ServerActorProtocol):
                     }
                 ]
             }
+            if return_full_logprobs:
+                payload["choices"][0][PackedField.FULL_LOGPROBS.value] = full_payload
             return Response(content=orjson.dumps(payload), media_type="application/json")
 
     async def shutdown(self) -> None:

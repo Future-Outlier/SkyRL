@@ -80,6 +80,24 @@ def test_empty_logprobs_input():
     assert build_logprobs_content([], []) == ([], 0)
 
 
+def test_full_logprob_rows_round_trip_without_changing_float32_bits():
+    codec = pytest.importorskip("isoexec.integrations.full_distribution")
+    token_ids = [1, 2]
+    values = np.array(
+        [[-3.0, np.nextafter(np.float32(-0.25), np.float32(0.0)), -2.0], [-4.0, -5.0, -0.75]],
+        dtype=np.float32,
+    )
+    rows = [{token_id: _Logprob(float(value)) for token_id, value in enumerate(row)} for row in values]
+
+    packed = codec.pack_full_logprobs(token_ids, rows, vocab_size=3)
+    raw = orjson.dumps(_body(full_logprobs=packed))
+    envelope = load_packed_body(raw)["choices"][0][PackedField.FULL_LOGPROBS]
+    decoded = codec.decode_packed_full_logprobs(envelope)
+
+    assert isinstance(envelope[PackedArrayKey.DATA], memoryview)
+    assert decoded.tobytes() == values.tobytes()
+
+
 def test_null_logprob_entry_is_clamped_not_raised():
     # An entry present but None must take the floor rather than raise AttributeError.
     assert build_logprobs_content([7], [{7: None}]) == ([{"logprob": CLAMPED_LOGPROB}], 1)

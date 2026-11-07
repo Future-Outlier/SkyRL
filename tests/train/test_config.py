@@ -156,6 +156,10 @@ def test_cli_overrides_empty_args():
     cfg = SkyRLTrainConfig.from_cli_overrides([])
     assert cfg.trainer.policy.model.path == "Qwen/Qwen2.5-1.5B-Instruct"
     assert cfg.trainer.seed == 42
+    assert "enable_isoexec" not in cfg.__dataclass_fields__
+    assert "rollout_logprob_comparison" not in cfg.trainer.__dataclass_fields__
+    assert "logprob_output" not in cfg.generator.inference_engine.__dataclass_fields__
+    assert cfg.isoexec is None
 
 
 def test_cli_overrides_fp8_param_gather():

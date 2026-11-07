@@ -2,6 +2,7 @@
 uv run --extra dev --extra skyrl-train --isolated pytest tests/train/generators/test_generator_output_utils.py
 """
 
+from typing import Any, cast
 from unittest.mock import patch
 
 import numpy as np
@@ -32,6 +33,7 @@ def test_generator_output_concatenation():
         "stop_reasons",
         "rollout_metrics",
         "rollout_logprobs",
+        "rollout_full_logprobs",
         "rollout_expert_indices",
         "rollout_sample_support",
         # optional but present in the signature
@@ -162,6 +164,35 @@ def test_slice_generator_output_slices_each_component_of_a_dict_field():
     assert sliced["rollout_logprobs"] is None
     assert sliced["rollout_metrics"] == {"generate/avg_num_tokens": 1.0}
     assert "rollout_metrics" not in slice_generator_output(generator_output, [1], preserve_metrics=False)
+
+
+@pytest.mark.parametrize("presence", ["absent", "null", "rows", "mixed"])
+def test_full_logprobs_follow_generic_list_concatenation(presence):
+    outputs: list[dict[str, Any]] = [
+        {"prompt_token_ids": [[1]], "response_ids": [[token]], "rewards": [1.0], "loss_masks": [[1]]}
+        for token in (2, 3)
+    ]
+    rows = [np.full((1, 4), value, dtype=np.float32) for value in (-1.0, -2.0)]
+    if presence == "null":
+        for output in outputs:
+            output["rollout_full_logprobs"] = None
+    elif presence in ("rows", "mixed"):
+        outputs[0]["rollout_full_logprobs"] = [rows[0]]
+        if presence == "rows":
+            outputs[1]["rollout_full_logprobs"] = [rows[1]]
+    if presence == "mixed":
+        for ordered in (outputs, outputs[::-1]):
+            with pytest.raises(ValueError, match="all have null rollout_full_logprobs"):
+                concatenate_generator_outputs(cast(list[GeneratorOutput], ordered))
+    else:
+        result = concatenate_generator_outputs(cast(list[GeneratorOutput], outputs[::-1]))
+        if presence == "rows":
+            combined = result.get("rollout_full_logprobs")
+            assert combined is not None
+            assert combined[0] is rows[1]
+            assert combined[1] is rows[0]
+        else:
+            assert result.get("rollout_full_logprobs") is None
 
 
 def test_time_split_rollout_metrics():

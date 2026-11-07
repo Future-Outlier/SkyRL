@@ -212,7 +212,13 @@ def _base_vllm_cli_args(model_path: str, ie_cfg: InferenceEngineConfig, seed: in
     role builders below add their own settings on top and apply ``engine_init_kwargs`` last.
     """
     from vllm import AsyncEngineArgs
-    from vllm.entrypoints.common.cli_args import FrontendArgs
+
+    try:
+        from vllm.entrypoints.common.cli_args import FrontendArgs
+    except ModuleNotFoundError as error:
+        if error.name not in ("vllm.entrypoints.common", "vllm.entrypoints.common.cli_args"):
+            raise
+        from vllm.entrypoints.launchers.cli_args import FrontendArgs
     from vllm.platforms import current_platform
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -346,7 +352,8 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         logger.info(f"vLLM speculative decoding enabled: speculative_config={spec_cfg}")
 
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
-    _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
+    if cfg.isoexec is None:
+        _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
     _apply_serialized_fp8_weight_sync_defaults(
         ie_cfg,
         engine_kwargs,
@@ -364,6 +371,10 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
             }
             logger.info(f"vLLM MoE expert LoRA slot rank: {expert_rank} (max_lora_rank={args.max_lora_rank})")
 
+    if cfg.isoexec is not None:
+        from isoexec.integrations.skyrl.config import engine_args
+
+        engine_args(cfg, args)
     return args
 
 

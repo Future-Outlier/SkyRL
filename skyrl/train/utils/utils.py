@@ -9,7 +9,7 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import ray
 import torch
@@ -453,6 +453,19 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     # side (vLLM MTP speculative decoding) so both stay consistent.
     _apply_mtp_config(cfg)
     _validate_draft_weight_sync_cfg(cfg)
+
+    if cfg.isoexec is not None:
+        try:
+            from isoexec.integrations.skyrl.bootstrap import (
+                validate_config as resolve_isoexec,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name == "isoexec":
+                raise RuntimeError(
+                    "Configuring isoexec requires the local IsoExec package in the runtime environment"
+                ) from exc
+            raise
+        resolve_isoexec(cfg)
 
     from skyrl.backends.skyrl_train.utils.ppo_utils import (
         AdvantageEstimatorRegistry,
@@ -1289,6 +1302,10 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
             env_vars[var_name] = value
 
+    if cfg.isoexec is not None:
+        from isoexec.integrations.skyrl.bootstrap import worker_environment
+
+        worker_environment(cfg, env_vars)
     return env_vars
 
 
@@ -1368,7 +1385,12 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    init_kwargs: dict[str, Any] = {"runtime_env": {"env_vars": env_vars}}
+    if cfg.isoexec is not None:
+        from isoexec.integrations.skyrl.bootstrap import ray_init_kwargs
+
+        init_kwargs = ray_init_kwargs(env_vars)
+    ray.init(**init_kwargs, log_to_driver=True)
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")

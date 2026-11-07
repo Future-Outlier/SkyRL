@@ -97,6 +97,15 @@ def test_a_request_without_features_keeps_a_token_prompt():
     assert engine.prompt == {"prompt_token_ids": [1, 2]}
 
 
+@pytest.mark.parametrize("value", [False, None, "false", 0])
+def test_disabled_or_malformed_full_request_does_not_import_isoexec(monkeypatch, value):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "isoexec.integrations.skyrl.inference", None)
+    response, _ = _post({"token_ids": [1, 2], "sampling_params": {"temperature": 1.0}, "return_full_logprobs": value})
+    assert response.status_code == (200 if value is False else 400)
+
+
 @pytest.mark.parametrize(
     "features",
     [

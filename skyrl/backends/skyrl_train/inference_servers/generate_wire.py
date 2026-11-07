@@ -47,6 +47,7 @@ class PackedArrayKey(StrEnum):
 class PackedField(StrEnum):
     """Response-body fields whose value is a packed-array envelope."""
 
+    FULL_LOGPROBS = "full_logprobs"
     ROUTED_EXPERTS = "routed_experts"
     ROLLOUT_SAMPLE_SUPPORT = "rollout_sample_support"
     # float32 sampler logprob of each support member, in the support's member order.

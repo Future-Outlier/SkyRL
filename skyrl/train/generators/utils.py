@@ -320,7 +320,12 @@ def concatenate_generator_outputs(
     """
     assert len(generator_outputs) > 0
     # Per-token side channels must be populated consistently across batches.
-    for all_or_nothing_field in ("rollout_logprobs", "rollout_expert_indices", "rollout_sample_support"):
+    for all_or_nothing_field in (
+        "rollout_logprobs",
+        "rollout_full_logprobs",
+        "rollout_expert_indices",
+        "rollout_sample_support",
+    ):
         present = [output.get(all_or_nothing_field) is not None for output in generator_outputs]
         if any(present) and not all(present):
             raise ValueError(
