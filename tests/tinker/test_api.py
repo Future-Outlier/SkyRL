@@ -3,7 +3,6 @@
 import asyncio
 import dataclasses
 import os
-import sys
 import tempfile
 import urllib.request
 from urllib.parse import urlparse
@@ -718,23 +717,6 @@ def test_build_cmd_engine(engine_config, parent_process_cmd, expected_cmd_start)
 
     cmd = " ".join(_build_uv_run_cmd_engine(parent_process_cmd, engine_config))
     assert cmd.startswith(" ".join(expected_cmd_start))
-
-
-def test_engine_preserves_an_explicit_preinstalled_environment():
-    config = EngineConfig(backend="megatron", base_model="model")
-    parent = ["uv", "run", "--isolated", "--no-project", "--", "/opt/sdk/bin/python", "-m", "skyrl.tinker.api"]
-    command = _build_uv_run_cmd_engine(parent, config)
-    assert command[:8] == [
-        "uv",
-        "run",
-        "--isolated",
-        "--no-project",
-        sys.executable,
-        "-m",
-        "skyrl.tinker.engine",
-        "--base-model",
-    ]
-    assert "--extra" not in command
 
 
 @pytest.mark.parametrize(

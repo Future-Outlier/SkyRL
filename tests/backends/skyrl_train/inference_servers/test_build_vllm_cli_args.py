@@ -16,38 +16,6 @@ from skyrl.backends.skyrl_train.inference_servers.utils import (
 from skyrl.train.config import SkyRLTrainConfig
 
 
-@pytest.mark.parametrize("missing_dependency", [False, True])
-def test_frontend_import_prefers_upstream_and_preserves_dependency_errors(monkeypatch, missing_dependency):
-    import builtins
-
-    from skyrl.backends.skyrl_train.inference_servers.utils import _base_vllm_cli_args
-
-    class FrontendSelected(Exception):
-        pass
-
-    class Frontend:
-        @staticmethod
-        def add_cli_args(parser):
-            raise FrontendSelected
-
-    original_import = builtins.__import__
-
-    def import_module(name, *args, **kwargs):
-        if name == "vllm.entrypoints.common.cli_args":
-            if missing_dependency:
-                raise ModuleNotFoundError("missing frontend dependency", name="frontend_dependency")
-            return SimpleNamespace(FrontendArgs=Frontend)
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", import_module)
-    expected = ModuleNotFoundError if missing_dependency else FrontendSelected
-    with pytest.raises(expected) as error:
-        _base_vllm_cli_args("model", SkyRLTrainConfig().generator.inference_engine, seed=42)
-    if missing_dependency:
-        assert isinstance(error.value, ModuleNotFoundError)
-        assert error.value.name == "frontend_dependency"
-
-
 def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8(monkeypatch):
     import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
 

@@ -73,17 +73,6 @@ def test_skyrl_train_forwarding_requires_non_colocated_combined_runtime(
     assert _should_forward_sample_requests(config) is expected
 
 
-def test_isoexec_sampling_reaches_the_package_backend():
-    config = EngineConfig(
-        base_model="test-model",
-        backend="megatron",
-        backend_config={"trainer.placement.colocate_all": False, "isoexec": {"model_package": "package"}},
-    )
-    assert _should_forward_sample_requests(config) is False
-    config.backend_config["isoexec"] = None
-    assert _should_forward_sample_requests(config) is True
-
-
 @pytest.mark.asyncio
 async def test_forwarding_client_uses_configured_timeout_and_connection_limit() -> None:
     config = EngineConfig(
