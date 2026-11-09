@@ -9,7 +9,7 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import ray
 import torch
@@ -1304,10 +1304,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
             env_vars[var_name] = value
 
-    if cfg.isoexec is not None:
-        from isoexec.integrations.skyrl.bootstrap import worker_environment
-
-        worker_environment(cfg, env_vars)
+    env_vars.update(cfg.trainer.extra_runtime_env_vars)
     return env_vars
 
 
@@ -1387,12 +1384,7 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    init_kwargs: dict[str, Any] = {"runtime_env": {"env_vars": env_vars}}
-    if cfg.isoexec is not None:
-        from isoexec.integrations.skyrl.bootstrap import ray_init_kwargs
-
-        init_kwargs = ray_init_kwargs(env_vars)
-    ray.init(**init_kwargs, log_to_driver=True)
+    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")

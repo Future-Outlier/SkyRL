@@ -49,16 +49,11 @@ class BasePPOExp:
             cfg: The fully resolved SkyRLTrainConfig instance.
         """
         self.cfg = cfg
-        tokenizer_options = {"model_name_or_path": cfg.trainer.policy.model.path}
-        if cfg.isoexec is not None:
-            from isoexec.integrations.skyrl.bootstrap import tokenizer_kwargs
-
-            tokenizer_options = tokenizer_kwargs(cfg)
         self.tokenizer = get_tokenizer(
+            self.cfg.trainer.policy.model.path,
             trust_remote_code=True,
             use_fast=not self.cfg.trainer.disable_fast_tokenizer,
             padding_side="left",
-            **tokenizer_options,
         )
         self.train_dataset = self.get_train_dataset()
         self.eval_dataset = self.get_eval_dataset()

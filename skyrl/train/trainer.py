@@ -119,9 +119,9 @@ class RayPPOTrainer:
     ):
         self.cfg = cfg
         if cfg.isoexec is not None:
-            from isoexec.integrations.skyrl.bootstrap import validate_config
+            from isoexec.integrations.skyrl.bootstrap import prepare_trainer_process
 
-            validate_config(cfg)
+            prepare_trainer_process(cfg)
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer

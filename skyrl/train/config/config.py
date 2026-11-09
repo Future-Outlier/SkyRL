@@ -1820,6 +1820,9 @@ class TrainerConfig(BaseConfig):
     See https://docs.skyrl.ai/docs/checkpointing-logging/logging"""
     enable_ray_gpu_monitor: bool = True
     """Enable background Ray GPU/RAM metrics collection and logging to wandb."""
+    extra_runtime_env_vars: Dict[str, str] = field(default_factory=dict)
+    """Environment variables added, after the ones SkyRL derives from the config, to the Ray runtime env of every
+    actor SkyRL starts (trainer workers and inference engines)."""
     log_mfu: bool = True
     """Log model FLOPs utilization (MFU) metrics for policy training each step.
 
