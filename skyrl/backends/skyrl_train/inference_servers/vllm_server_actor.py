@@ -651,11 +651,13 @@ class VLLMServerActor(ServerActorProtocol):
 
             if final_res is None:
                 raise HTTPException(status_code=500, detail="vLLM returned no output")
-            full_payload = None
+            packed_full_logprobs = None
             if return_full_logprobs:
-                from isoexec.integrations.skyrl.inference import response_payload
+                from isoexec.integrations.skyrl.inference import (
+                    build_full_logprob_payload,
+                )
 
-                full_payload = response_payload(final_res, engine.model_config.get_vocab_size())
+                packed_full_logprobs = build_full_logprob_payload(final_res, engine.model_config.get_vocab_size())
             resp = final_res.outputs[0]
 
             token_ids_out = list(resp.token_ids)
@@ -700,7 +702,7 @@ class VLLMServerActor(ServerActorProtocol):
                 ]
             }
             if return_full_logprobs:
-                payload["choices"][0][PackedField.FULL_LOGPROBS.value] = full_payload
+                payload["choices"][0][PackedField.FULL_LOGPROBS.value] = packed_full_logprobs
             return Response(content=orjson.dumps(payload), media_type="application/json")
 
     async def shutdown(self) -> None:
