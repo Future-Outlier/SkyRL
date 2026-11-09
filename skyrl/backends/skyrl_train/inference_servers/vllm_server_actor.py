@@ -602,13 +602,15 @@ class VLLMServerActor(ServerActorProtocol):
                     status_code=400,
                     detail="return_sample_support_logprobs requires return_sample_support",
                 )
+
             return_full_logprobs = body.get("return_full_logprobs", False)
             if not isinstance(return_full_logprobs, bool):
                 raise HTTPException(status_code=400, detail="return_full_logprobs must be a boolean")
             if return_full_logprobs:
                 from isoexec.integrations.skyrl.inference import validate_request
 
-                return_full_logprobs = validate_request(body, sampling_params_dict, engine.model_config, lora_request)
+                validate_request(body, sampling_params_dict, engine.model_config, lora_request)
+
             if capture_sample_support:
                 # Sample support requires a bounded, non-degenerate top-k set.
                 top_k = sampling_params_dict.get("top_k")
