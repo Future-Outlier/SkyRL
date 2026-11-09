@@ -262,7 +262,7 @@ class MegatronStrategy(DistributedStrategy):
             expert_tensor_parallel_size=self.megatron_config.expert_tensor_parallel_size,
             use_sharp=False,
             context_parallel_size=self.megatron_config.context_parallel_size,
-            nccl_communicator_config_path=self.get_nccl_communicator_config(),
+            nccl_communicator_config_path=None,
         )
         self.set_seed(self.seed)
         self.world_size = dist.get_world_size()
@@ -300,10 +300,6 @@ class MegatronStrategy(DistributedStrategy):
 
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
         raise NotImplementedError()
-
-    def get_nccl_communicator_config(self) -> Optional[str]:
-        """Return per-communicator settings before model-parallel groups are created."""
-        return None
 
     def optimizer_step(
         self,

@@ -28,12 +28,11 @@ uv run --isolated --no-project "$ISOEXEC_ENV/venv/bin/python" \
 ```
 
 The managed runtime installs the dependency versions in IsoExec's
-`environments/default.toml`, including vLLM 0.30.0, Transformers 5.22.0 and
-CUTLASS DSL 4.5.2. The `PYTHONPATH` above selects these two source checkouts
+`environments/default.toml`, including vLLM 0.33.0, Torch 2.14.0,
+Transformers 5.22.0 and CUTLASS DSL 4.8.0. The `PYTHONPATH` above selects these two source checkouts
 while keeping that SDK. SkyRL's `pyproject.toml` and `uv.lock` remain identical
-to upstream main and select vLLM 0.33. The IsoExec integration supports only
-vLLM 0.30.0, so run these examples with the managed SDK interpreter shown here;
-`uv --extra megatron` would select SkyRL's upstream dependencies instead. Use a new runtime directory
+to the PR's upstream-main baseline. Run these examples with the managed SDK interpreter shown here;
+`uv --extra megatron` would select SkyRL's dependencies without IsoExec's overrides. Use a new runtime directory
 when its recorded environment differs from the selected manifest.
 
 ## Shared IsoExec settings
