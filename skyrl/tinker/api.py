@@ -5,6 +5,7 @@ import random
 import re
 import shutil
 import signal
+import sys
 import threading
 from contextlib import asynccontextmanager, nullcontext, suppress
 from datetime import datetime, timedelta, timezone
@@ -233,6 +234,8 @@ def _should_forward_sample_requests(config: EngineConfig) -> bool:
     if config.backend not in ("megatron", "fsdp") or config.runtime_role != "combined":
         return False
     backend_config = config.backend_config or {}
+    if backend_config.get("isoexec") is not None:
+        return False  # The package backend owns sampling evidence and weight-version checks.
     return not bool(backend_config.get("trainer.placement.colocate_all", True))
 
 
@@ -297,8 +300,13 @@ def _build_uv_run_cmd_engine(parent_cmd: list[str], engine_config: BaseModel) ->
     parent_flags = _get_parent_uv_run_args(parent_cmd)
     logger.debug(f"Detected API server uv run flags: {parent_flags}")
     cmd.extend(parent_flags)
-    # NOTE: uv deduplicates extras so we can unconditionally add the tinker extra
-    cmd.extend(["--extra", "tinker", "--extra", engine_config.backend])
+    if "--no-project" in parent_flags:
+        # An isolated uv environment has no installed SDK; execute the API's
+        # explicitly selected interpreter when using a preinstalled runtime.
+        cmd.append(sys.executable)
+    else:
+        # uv deduplicates extras when the API was started from a project.
+        cmd.extend(["--extra", "tinker", "--extra", engine_config.backend])
     cmd.extend(["-m", "skyrl.tinker.engine"])
     cmd.extend(config_to_argv(engine_config))
     return cmd

@@ -30,12 +30,16 @@ def test_cli_preserves_mapping_for_package_validation():
     assert SkyRLTrainConfig.from_cli_overrides(["isoexec={}"]).isoexec == {}
 
 
-def test_tinker_refuses_isoexec_without_the_rl_comparison_lifecycle():
+def test_tinker_isoexec_requires_the_package_backend():
     backend = pytest.importorskip("skyrl.backends.skyrl_train_backend")
     overrides = backend.MegatronBackendOverrides(
         **{
             "isoexec": {"model_package": "isoexec.models.qwen3_5", "full_logprob_comparision": True},
         }
     )
-    with pytest.raises(ValueError, match="Tinker backend is not supported"):
-        backend._build_skyrl_train_config("model", overrides)
+    cfg = backend._build_skyrl_train_config("model", overrides)
+    assert cfg.isoexec == overrides.model_extra["isoexec"]
+    native = object.__new__(backend.SkyRLTrainBackend)
+    native.base_model, native.config = "model", overrides
+    with pytest.raises(ValueError, match="select its backend"):
+        native._build_config()
