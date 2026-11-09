@@ -118,6 +118,10 @@ class RayPPOTrainer:
         callbacks: Optional[List[TrainingCallback]] = None,
     ):
         self.cfg = cfg
+        if cfg.isoexec is not None:
+            from isoexec.integrations.skyrl.bootstrap import prepare_trainer_process
+
+            prepare_trainer_process(cfg)
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
@@ -1021,6 +1025,12 @@ class RayPPOTrainer:
             },
         )
         training_input.metadata = {"uids": uids}
+        if self.cfg.isoexec is not None:
+            from isoexec.integrations.skyrl.full_distribution import (
+                prepare_training_input,
+            )
+
+            prepare_training_input(self, training_input, generator_output)
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 
@@ -1465,7 +1475,11 @@ class RayPPOTrainer:
 
         # Policy forward. Skipped for losses that optimize against rollout logprobs (see
         # `_skip_policy_forward`), where the resulting logprobs are never read.
-        if self._skip_policy_forward(training_input):
+        if self.cfg.isoexec is not None:
+            from isoexec.integrations.skyrl.full_distribution import policy_forward
+
+            action_log_probs = policy_forward(self, training_input, data_fwd_pass)
+        elif self._skip_policy_forward(training_input):
             action_log_probs = None
         else:
             action_log_probs = self._execute_forward_pass(

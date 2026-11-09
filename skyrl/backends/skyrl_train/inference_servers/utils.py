@@ -346,7 +346,8 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         logger.info(f"vLLM speculative decoding enabled: speculative_config={spec_cfg}")
 
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
-    _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
+    if cfg.isoexec is None:
+        _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
     _apply_serialized_fp8_weight_sync_defaults(
         ie_cfg,
         engine_kwargs,
@@ -364,6 +365,10 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
             }
             logger.info(f"vLLM MoE expert LoRA slot rank: {expert_rank} (max_lora_rank={args.max_lora_rank})")
 
+    if cfg.isoexec is not None:
+        from isoexec.integrations.skyrl.config import configure_isoexec_vllm_engine
+
+        configure_isoexec_vllm_engine(cfg, args)
     return args
 
 
