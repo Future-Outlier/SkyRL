@@ -22,9 +22,7 @@ from tests.train.util import example_dummy_config
 
 @pytest.fixture
 def dummy_config() -> SkyRLTrainConfig:
-    cfg = example_dummy_config()
-    cfg.generator.inference_engine.enable_ray_prometheus_stats = False
-    return cfg
+    return example_dummy_config()
 
 
 class DummyDataset:

@@ -171,13 +171,9 @@ def test_only_native_reset_route(backends):
 
 @pytest.mark.asyncio
 async def test_production_app_exposes_native_reset_route(monkeypatch):
-    from skyrl.backends.skyrl_train.inference_servers.utils import build_vllm_cli_args
-    from skyrl.train.config import SkyRLTrainConfig
-
     monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "1")
     monkeypatch.setattr(platforms, "_current_platform", UnspecifiedPlatform())
-    cfg = SkyRLTrainConfig.from_cli_overrides(["trainer.policy.model.path=model"])
-    cli_args = build_vllm_cli_args(cfg)
+    cli_args = vllm_server_actor._build_standalone_cli_args([])
     cli_args.enable_scale_out = True
     app = vllm_server_actor.build_app(cli_args)
     engine = CacheEngine()
