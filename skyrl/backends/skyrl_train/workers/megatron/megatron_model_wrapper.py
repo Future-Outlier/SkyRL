@@ -277,8 +277,8 @@ class MegatronModelWrapper:
         if actor_optimizer is not None:
             config.grad_scale_func = actor_optimizer.scale_loss
 
-    def _observe_forward(self, logits, data, packed_seq_params) -> None:
-        """Allow a model wrapper to inspect scored logits before releasing them."""
+    def _verify_full_logprobs(self, logits, data, packed_seq_params) -> None:
+        """Verify the prescore logits against ``rollout_full_logprobs`` before they are released."""
 
     def _model_attention_mask(self, attention_mask):
         if self._implicit_causal_mask_only:
@@ -523,7 +523,7 @@ class MegatronModelWrapper:
                     cp_group=None,
                     chunk_size=self.cfg.logprobs_chunk_size,  # chunk seq dim to bound peak memory
                 )
-            self._observe_forward(logits, data, packed_seq_params)
+            self._verify_full_logprobs(logits, data, packed_seq_params)
             return torch.tensor(0.0, device=token_logprobs.device), {"log_probs": token_logprobs}
 
         def forward_step(batch_iter, model):
