@@ -366,9 +366,9 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
             logger.info(f"vLLM MoE expert LoRA slot rank: {expert_rank} (max_lora_rank={args.max_lora_rank})")
 
     if cfg.isoexec is not None:
-        from isoexec.integrations.skyrl.config import engine_args
+        from isoexec.integrations.skyrl.config import configure_isoexec_vllm_engine
 
-        engine_args(cfg, args)
+        configure_isoexec_vllm_engine(cfg, args)
     return args
 
 
