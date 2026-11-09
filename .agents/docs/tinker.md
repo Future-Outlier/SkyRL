@@ -23,16 +23,6 @@ uv run --extra tinker --extra fsdp -m skyrl.tinker.api \
 
 The API process spawns the engine as a child subprocess (via `uv run -m skyrl.tinker.engine`). If the engine crashes, the API server auto-terminates.
 
-With `backend_config.isoexec` configured, the engine selects the package-owned
-`isoexec.integrations.skyrl.tinker.IsoExecTinkerBackend`. It supports Megatron
-full-parameter models; IsoExec validates the allowed requests and owns full-row
-comparison before updates. Samples stay on the engine path so API forwarding
-cannot bypass its row capture and version checks. Native backends remain selected
-when `isoexec` is absent or null. The backend exposes `_load_tokenizer` and
-`_build_config` so a package can resolve checkpoint metadata before model allocation.
-For an existing SDK launched with `uv run --isolated --no-project -- /path/to/python`,
-the child engine runs the API's interpreter without trying to install project extras.
-
 ## Key API Endpoints
 
 All endpoints are under `/api/v1/`. Requests are async -- submit via POST, get a `request_id`, poll `retrieve_future`.
