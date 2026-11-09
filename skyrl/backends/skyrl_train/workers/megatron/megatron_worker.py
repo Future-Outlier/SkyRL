@@ -898,7 +898,6 @@ class MegatronWorker:
                     full_logprob_mask=micro["loss_mask"],
                     rollout_logprobs=micro["rollout_logprobs"],
                     sample_indices=micro.get("sample_indices"),
-                    global_step=(micro.metadata or {}).get("global_step"),
                 )
 
         if use_token_batching:

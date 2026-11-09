@@ -846,11 +846,10 @@ class MegatronModelWrapper:
                 fused_vocab_start, fused_vocab_end = tp_rank * _v_local, (tp_rank + 1) * _v_local
 
             # temperature normalization (the fused path applies it inside the op)
-            if temperature != 1.0 and not fused_lm_head:
-                if self._scale_logits is not None:
-                    logits = self._scale_logits(logits, temperature)
-                else:
-                    logits.div_(temperature)
+            if self._scale_logits is not None and not fused_lm_head:
+                logits = self._scale_logits(logits, temperature)
+            elif temperature != 1.0 and not fused_lm_head:
+                logits.div_(temperature)
 
             shard_vocab_size = lm_head_weight.shape[0] if fused_lm_head else logits.shape[-1]
             support_entropy = None
