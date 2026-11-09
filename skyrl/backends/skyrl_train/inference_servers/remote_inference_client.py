@@ -391,9 +391,9 @@ class RemoteGenerateClient:
         path = "/skyrl/v1/generate" if packed_side_channels else "/inference/v1/generate"
         request_sampling_params = dict(sampling_params)
         if return_full_logprobs:
-            from isoexec.integrations.skyrl.inference import request_params
+            from isoexec.integrations.skyrl.inference import build_full_logprob_params
 
-            request_sampling_params = request_params(
+            request_sampling_params = build_full_logprob_params(
                 sampling_params, sample_support=return_sample_support, features=mm_features
             )
         if routed_experts_prompt_start is not None:
