@@ -648,7 +648,11 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
         ie_cfg = cfg.generator.inference_engine
         num_rollout_gpus = (
-            ie_cfg.num_engines * ie_cfg.tensor_parallel_size * ie_cfg.pipeline_parallel_size * ie_cfg.data_parallel_size
+            ie_cfg.num_engines
+            * ie_cfg.tensor_parallel_size
+            * ie_cfg.pipeline_parallel_size
+            * ie_cfg.data_parallel_size
+            * ie_cfg.engine_init_kwargs.get("prefill_context_parallel_size", 1)
         )
         assert num_policy_gpus == num_rollout_gpus, (
             f"num_policy_gpus ({num_policy_gpus}) and num_rollout_gpus ({num_rollout_gpus}) "
