@@ -88,8 +88,11 @@ def create_inference_servers(
     """
     from skyrl.backends.skyrl_train.inference_servers.server_group import ServerGroup
     from skyrl.backends.skyrl_train.inference_servers.vllm_router import VLLMRouter
+    from skyrl.backends.skyrl_train.inference_servers.vllm_server_actor import (
+        VLLMServerActor,
+    )
 
-    gpus_per_server = ie_cfg.tensor_parallel_size * ie_cfg.pipeline_parallel_size
+    gpus_per_server = VLLMServerActor.compute_num_gpus_per_server(cli_args)
     is_colocated = placement_group is not None
 
     if ie_cfg.enable_pd:

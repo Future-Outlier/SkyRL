@@ -850,6 +850,7 @@ def preprocess_packed_seqs(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         total_tokens=cu_seqlens_padded_cpu[-1],
     )
+    setattr(packed_seq_params, "unpadded_cu_seqlens_q", cu_seqlens)
     if pre_process:
         return input_ids_rmpad.unsqueeze(0), packed_seq_params
     else:

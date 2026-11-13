@@ -262,6 +262,9 @@ class MegatronStrategy(DistributedStrategy):
             expert_tensor_parallel_size=self.megatron_config.expert_tensor_parallel_size,
             use_sharp=False,
             context_parallel_size=self.megatron_config.context_parallel_size,
+            hierarchical_context_parallel_sizes=self.megatron_config.transformer_config_kwargs.get(
+                "hierarchical_context_parallel_sizes"
+            ),
             nccl_communicator_config_path=None,
         )
         self.set_seed(self.seed)

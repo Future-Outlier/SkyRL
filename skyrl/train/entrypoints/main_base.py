@@ -119,7 +119,10 @@ class BasePPOExp:
             return None
 
         ie_cfg = self.cfg.generator.inference_engine
-        per_engine_gpu_count = ie_cfg.tensor_parallel_size * ie_cfg.pipeline_parallel_size * ie_cfg.data_parallel_size
+        pcp = ie_cfg.engine_init_kwargs.get("prefill_context_parallel_size", 1)
+        per_engine_gpu_count = (
+            ie_cfg.tensor_parallel_size * ie_cfg.pipeline_parallel_size * ie_cfg.data_parallel_size * pcp
+        )
         total_gpu_slots = ie_cfg.num_engines * per_engine_gpu_count
 
         pg = placement_group(

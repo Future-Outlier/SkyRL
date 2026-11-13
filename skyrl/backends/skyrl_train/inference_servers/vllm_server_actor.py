@@ -160,13 +160,12 @@ class VLLMServerActor(ServerActorProtocol):
 
     @staticmethod
     def compute_num_gpus_per_server(vllm_cli_args: Namespace) -> int:
-        """Compute the number of GPUs needed per server based on TP * PP.
-
-        This logic might need adjustment if we want to support other
-        parallelism schemes. If we get to this point, we should add a
-        vllm-specific utility for it and keep the logic inside the engine.
-        """
-        return vllm_cli_args.tensor_parallel_size * vllm_cli_args.pipeline_parallel_size
+        """GPU workers per vLLM server. DCP reuses workers in the TP/PCP mesh."""
+        return (
+            vllm_cli_args.tensor_parallel_size
+            * vllm_cli_args.pipeline_parallel_size
+            * getattr(vllm_cli_args, "prefill_context_parallel_size", 1)
+        )
 
     @staticmethod
     def prepare_server_kwargs(
